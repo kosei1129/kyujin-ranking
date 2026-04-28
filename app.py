@@ -1,7 +1,7 @@
 """
 求人給与ランキング Webアプリ
 起動: python3 app.py
-ブラウザ: http://localhost:5000
+ブラウザ: http://localhost:8080
 """
 
 import asyncio
@@ -20,6 +20,7 @@ SHOKUSHU_LIST = [
     "製造・工場", "介護・福祉", "ドライバー", "軽作業",
     "医療・看護", "デザイナー",
 ]
+
 
 # ─────────────────────────────────────────
 # 給与パース
@@ -75,20 +76,66 @@ def salary_display(parsed: dict) -> str:
 
 
 # ─────────────────────────────────────────
+# 共通：ボディテキストからの汎用フォールバック
+# ─────────────────────────────────────────
+
+NOISE_PATTERN = re.compile(
+    r"^(検索|絞り込み|ログイン|新規登録|会員|エリア|こだわり|条件|特集|新着|おすすめ|"
+    r"アルバイト|バイト|正社員|派遣|パート|契約社員|求人|仕事|サイト|ページ|一覧|"
+    r"トップ|ホーム|ナビ|メニュー|クリック|詳細|閲覧|確認|\d+件|\d+ページ)$"
+)
+
+async def generic_body_fallback(page, site_name: str) -> list:
+    jobs = []
+    try:
+        body = await page.inner_text("body")
+        lines = [l.strip() for l in body.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            if not re.search(r"(時給|月給|年収|給与)[^\d]*\d+", line):
+                continue
+            title, company = "", ""
+            for j in range(i - 1, max(0, i - 12), -1):
+                ln = lines[j]
+                if len(ln) < 5 or NOISE_PATTERN.match(ln):
+                    continue
+                if re.search(r"\d+万|\d+円|〜|以上|以下|応相談", ln):
+                    continue
+                if not title:
+                    title = ln[:80]
+                elif not company:
+                    company = ln[:50]
+                    break
+            if title:
+                jobs.append({
+                    "site": site_name, "title": title,
+                    "company": company, "location": "", "salary_text": line,
+                })
+            if len(jobs) >= 20:
+                break
+    except Exception:
+        pass
+    return jobs
+
+
+# ─────────────────────────────────────────
 # スクレイパー（各サイト）
 # ─────────────────────────────────────────
 
 async def scrape_indeed(page, keyword):
     jobs = []
     try:
-        await page.goto(f"https://jp.indeed.com/jobs?q={keyword}&sort=date&limit=20",
-                        timeout=30000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(4000)
+        await page.goto(
+            f"https://jp.indeed.com/jobs?q={keyword}&sort=date&limit=20",
+            timeout=30000, wait_until="domcontentloaded",
+        )
+        await page.wait_for_timeout(5000)
+        title_text = await page.title()
         body = await page.inner_text("body")
-        if "Security Check" in await page.title() or "追加認証" in body:
-            await asyncio.sleep(10)
+        if "Security Check" in title_text or "追加認証" in body or "Captcha" in body:
+            await asyncio.sleep(12)
             await page.reload(wait_until="domcontentloaded")
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(6000)
+
         for card in (await page.query_selector_all("div.job_seen_beacon, div[data-jk]"))[:20]:
             try:
                 te = await card.query_selector("h2.jobTitle span, h2 a span")
@@ -99,13 +146,18 @@ async def scrape_indeed(page, keyword):
                 le = await card.query_selector("[data-testid='text-location'], .companyLocation")
                 t = (await te.inner_text()).strip() if te else ""
                 if t:
-                    jobs.append({"site": "Indeed", "title": t,
-                                 "company": (await ce.inner_text()).strip() if ce else "",
-                                 "location": (await le.inner_text()).strip() if le else "",
-                                 "salary_text": (await se.inner_text()).strip() if se else ""})
+                    jobs.append({
+                        "site": "Indeed", "title": t,
+                        "company": (await ce.inner_text()).strip() if ce else "",
+                        "location": (await le.inner_text()).strip() if le else "",
+                        "salary_text": (await se.inner_text()).strip() if se else "",
+                    })
             except Exception:
                 continue
-    except Exception as e:
+
+        if not jobs:
+            jobs = await generic_body_fallback(page, "Indeed")
+    except Exception:
         pass
     return jobs
 
@@ -113,34 +165,36 @@ async def scrape_indeed(page, keyword):
 async def scrape_engage(page, keyword):
     jobs = []
     try:
-        await page.goto(f"https://en-gage.net/user/search/?searchWord={keyword}",
-                        timeout=30000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
+        await page.goto(
+            f"https://en-gage.net/user/search/?searchWord={keyword}",
+            timeout=30000, wait_until="domcontentloaded",
+        )
+        await page.wait_for_timeout(5000)
+
         cards = await page.query_selector_all(
-            "article.job-card,li.job-card,div[class*='jobCard'],div[class*='job-item']")
-        if not cards:
-            lines = [l.strip() for l in (await page.inner_text("body")).split("\n") if l.strip()]
-            for i, line in enumerate(lines):
-                if re.search(r"時給|月給|年収", line):
-                    jobs.append({"site": "エンゲージ",
-                                 "title": (lines[i - 1] if i > 0 else "")[:60],
-                                 "company": "", "location": "", "salary_text": line})
-                    if len(jobs) >= 20:
-                        break
-            return jobs
-        for card in cards[:20]:
-            try:
-                te = await card.query_selector("h2,h3,[class*='title']")
-                ce = await card.query_selector("[class*='company']")
-                se = await card.query_selector("[class*='salary'],[class*='wage'],[class*='kyuyo']")
-                t = (await te.inner_text()).strip() if te else ""
-                if t:
-                    jobs.append({"site": "エンゲージ", "title": t,
-                                 "company": (await ce.inner_text()).strip() if ce else "",
-                                 "location": "",
-                                 "salary_text": (await se.inner_text()).strip() if se else ""})
-            except Exception:
-                continue
+            "article.job-card, li.job-card, div[class*='jobCard'], "
+            "div[class*='job-item'], article[class*='job'], [class*='JobCard']",
+        )
+        if cards:
+            for card in cards[:20]:
+                try:
+                    te = await card.query_selector("h2, h3, [class*='title'], [class*='Title']")
+                    ce = await card.query_selector("[class*='company'], [class*='Company']")
+                    se = await card.query_selector(
+                        "[class*='salary'], [class*='Salary'], [class*='wage'], [class*='kyuyo']")
+                    t = (await te.inner_text()).strip() if te else ""
+                    if t:
+                        jobs.append({
+                            "site": "エンゲージ", "title": t,
+                            "company": (await ce.inner_text()).strip() if ce else "",
+                            "location": "",
+                            "salary_text": (await se.inner_text()).strip() if se else "",
+                        })
+                except Exception:
+                    continue
+
+        if not jobs:
+            jobs = await generic_body_fallback(page, "エンゲージ")
     except Exception:
         pass
     return jobs
@@ -150,8 +204,10 @@ async def scrape_mynavi_baito(page, keyword):
     jobs = []
     try:
         word = keyword.replace("職", "").replace("・", "")
-        await page.goto(f"https://baito.mynavi.jp/ai/word_{word}/",
-                        timeout=30000, wait_until="domcontentloaded")
+        await page.goto(
+            f"https://baito.mynavi.jp/ai/word_{word}/",
+            timeout=30000, wait_until="domcontentloaded",
+        )
         await page.wait_for_timeout(3000)
         for card in await page.query_selector_all(".tabJobOfferCard"):
             try:
@@ -166,10 +222,15 @@ async def scrape_mynavi_baito(page, keyword):
                         salary_text = lines[i + 1]
                         break
                 if title:
-                    jobs.append({"site": "マイナビ", "title": title,
-                                 "company": company, "location": "", "salary_text": salary_text})
+                    jobs.append({
+                        "site": "マイナビ", "title": title,
+                        "company": company, "location": "", "salary_text": salary_text,
+                    })
             except Exception:
                 continue
+
+        if not jobs:
+            jobs = await generic_body_fallback(page, "マイナビ")
     except Exception:
         pass
     return jobs
@@ -178,31 +239,60 @@ async def scrape_mynavi_baito(page, keyword):
 async def scrape_mynavi_tenshoku(page, keyword):
     jobs = []
     try:
-        await page.goto(f"https://tenshoku.mynavi.jp/list/?keyword={keyword}",
-                        timeout=30000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(4000)
-        for card in (await page.query_selector_all(".cassetteRecruit"))[:30]:
+        await page.goto(
+            f"https://tenshoku.mynavi.jp/list/?keyword={keyword}",
+            timeout=30000, wait_until="domcontentloaded",
+        )
+        await page.wait_for_timeout(6000)
+
+        # Try to wait for job cards
+        try:
+            await page.wait_for_selector(".cassetteRecruit, [class*='cassette'], [class*='recruit']", timeout=5000)
+        except Exception:
+            pass
+
+        cards = await page.query_selector_all(
+            ".cassetteRecruit, [class*='cassetteRecruit'], [class*='jobItem']"
+        )
+
+        for card in cards[:30]:
             try:
                 full = (await card.inner_text()).strip()
                 company, title = "", ""
-                he = await card.query_selector(".cassetteRecruit__heading")
+                he = await card.query_selector(
+                    ".cassetteRecruit__heading, [class*='heading'], [class*='Heading'], h2, h3")
                 if he:
                     hl = [l.strip() for l in (await he.inner_text()).split("\n") if l.strip()]
                     if hl:
                         company = hl[0].split("|")[0].strip() if "|" in hl[0] else hl[0]
                     if len(hl) > 1:
                         title = hl[1]
+                if not title:
+                    lines = [l.strip() for l in full.split("\n") if l.strip()]
+                    title = lines[1] if len(lines) > 1 else (lines[0] if lines else "")
+
                 salary_text = ""
-                m = re.search(r"給与\s*\t([^\n]+)", full)
-                if not m:
-                    m = re.search(r"給与\n([^\n]+)", full)
-                if m:
-                    salary_text = m.group(1).strip()
+                for pattern in [
+                    r"給与\s*\t([^\n]+)",
+                    r"給与\s*\n\s*([^\n]+)",
+                    r"月給[^\d]*(\d[\d,万円〜\-～以上]+)",
+                    r"年収[^\d]*(\d[\d,万円〜\-～以上]+)",
+                ]:
+                    m = re.search(pattern, full)
+                    if m:
+                        salary_text = m.group(1).strip()
+                        break
+
                 if title:
-                    jobs.append({"site": "マイナビ転職", "title": title,
-                                 "company": company, "location": "", "salary_text": salary_text})
+                    jobs.append({
+                        "site": "マイナビ転職", "title": title,
+                        "company": company, "location": "", "salary_text": salary_text,
+                    })
             except Exception:
                 continue
+
+        if not jobs:
+            jobs = await generic_body_fallback(page, "マイナビ転職")
     except Exception:
         pass
     return jobs
@@ -211,32 +301,56 @@ async def scrape_mynavi_tenshoku(page, keyword):
 async def scrape_en_tenshoku(page, keyword):
     jobs = []
     try:
-        await page.goto(f"https://employment.en-japan.com/keyword/{keyword}/",
-                        timeout=30000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
-        for card in (await page.query_selector_all(".jobSearchListUnit"))[:30]:
+        await page.goto(
+            f"https://employment.en-japan.com/keyword/{keyword}/",
+            timeout=30000, wait_until="domcontentloaded",
+        )
+        await page.wait_for_timeout(5000)
+
+        try:
+            await page.wait_for_selector(".jobSearchListUnit, [class*='jobSearch'], [class*='job-list']", timeout=5000)
+        except Exception:
+            pass
+
+        cards = await page.query_selector_all(
+            ".jobSearchListUnit, [class*='jobSearchList'], [class*='job-unit']"
+        )
+
+        for card in cards[:30]:
             try:
-                te = await card.query_selector(".jobNameText")
-                ce = await card.query_selector(".company")
+                te = await card.query_selector(".jobNameText, [class*='jobName'], h2 a, h3 a")
+                ce = await card.query_selector(".company, [class*='company'], [class*='Company']")
                 title = (await te.inner_text()).strip() if te else ""
                 company = (await ce.inner_text()).strip() if ce else ""
                 card_text = (await card.inner_text()).strip()
                 salary_text = ""
-                m = re.search(r"給与\s*\n\s*([^\n]+)", card_text)
-                if m:
-                    salary_text = m.group(1).strip()
+                for pattern in [
+                    r"給与\s*\n\s*([^\n]+)",
+                    r"給与\s*([^\n]+)",
+                    r"月給[^\d]*(\d[\d,万円〜\-～以上]+)",
+                    r"年収[^\d]*(\d[\d,万円〜\-～以上]+)",
+                ]:
+                    m = re.search(pattern, card_text)
+                    if m:
+                        salary_text = m.group(1).strip()
+                        break
                 if title:
-                    jobs.append({"site": "エン転職", "title": title,
-                                 "company": company, "location": "", "salary_text": salary_text})
+                    jobs.append({
+                        "site": "エン転職", "title": title,
+                        "company": company, "location": "", "salary_text": salary_text,
+                    })
             except Exception:
                 continue
+
+        if not jobs:
+            jobs = await generic_body_fallback(page, "エン転職")
     except Exception:
         pass
     return jobs
 
 
 # ─────────────────────────────────────────
-# メインスクレイピング（キューにイベントを送る）
+# メインスクレイピング
 # ─────────────────────────────────────────
 
 async def run_scraper(keyword: str, q: queue.Queue):
@@ -252,15 +366,39 @@ async def run_scraper(keyword: str, q: queue.Queue):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-extensions",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+                "--window-size=1280,800",
+            ],
         )
         context = await browser.new_context(
             user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
             ),
+            viewport={"width": 1280, "height": 800},
             locale="ja-JP",
+            extra_http_headers={
+                "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            },
         )
+        # Remove webdriver fingerprint
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP','ja','en-US','en']});
+            window.chrome = {runtime:{}};
+        """)
 
         for site_name, fn in scrapers:
             q.put({"type": "progress", "site": site_name, "status": "searching"})
@@ -282,17 +420,17 @@ async def run_scraper(keyword: str, q: queue.Queue):
     # ランキング計算
     parsed_jobs = []
     for job in all_jobs:
-        p = parse_salary(job["salary_text"])
-        if p["jikyu_normalized"]:
-            parsed_jobs.append({**job, **p})
+        parsed = parse_salary(job["salary_text"])
+        if parsed["jikyu_normalized"]:
+            parsed_jobs.append({**job, **parsed})
 
     jikyu_ranking = sorted(
         [j for j in parsed_jobs if j.get("jikyu")],
-        key=lambda x: x["jikyu"], reverse=True
+        key=lambda x: x["jikyu"], reverse=True,
     )[:5]
 
     salary_ranking = sorted(
-        parsed_jobs, key=lambda x: x["jikyu_normalized"], reverse=True
+        parsed_jobs, key=lambda x: x["jikyu_normalized"], reverse=True,
     )[:5]
 
     def fmt(jobs):
@@ -306,7 +444,7 @@ async def run_scraper(keyword: str, q: queue.Queue):
         "jikyu_ranking": fmt(jikyu_ranking),
         "salary_ranking": fmt(salary_ranking),
     })
-    q.put(None)  # 終了シグナル
+    q.put(None)
 
 
 # ─────────────────────────────────────────
@@ -338,7 +476,7 @@ def search():
         while True:
             item = q.get()
             if item is None:
-                yield "data: {\"type\": \"end\"}\n\n"
+                yield 'data: {"type":"end"}\n\n'
                 break
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
 
@@ -350,7 +488,7 @@ def search():
 
 
 # ─────────────────────────────────────────
-# HTML テンプレート
+# HTML テンプレート（ライトビジネス）
 # ─────────────────────────────────────────
 
 HTML = """<!DOCTYPE html>
@@ -361,279 +499,347 @@ HTML = """<!DOCTYPE html>
 <title>求人給与ランキング</title>
 <style>
   :root {
-    --bg: #0f0f1a;
-    --surface: #1a1a2e;
-    --surface2: #16213e;
-    --accent: #e94560;
-    --accent2: #0f3460;
-    --text: #e0e0e0;
-    --text-dim: #888;
-    --border: #2a2a4a;
-    --green: #00b894;
-    --gold: #fdcb6e;
-    --silver: #b2bec3;
-    --bronze: #e17055;
+    --bg: #f0f4f8;
+    --surface: #ffffff;
+    --header: #1a3654;
+    --primary: #1d4ed8;
+    --primary-light: #eff6ff;
+    --primary-border: #bfdbfe;
+    --success: #15803d;
+    --success-light: #f0fdf4;
+    --success-border: #86efac;
+    --warning: #b45309;
+    --warning-light: #fffbeb;
+    --warning-border: #fcd34d;
+    --error: #dc2626;
+    --error-light: #fef2f2;
+    --error-border: #fca5a5;
+    --text: #111827;
+    --text-sub: #374151;
+    --text-muted: #6b7280;
+    --border: #e5e7eb;
+    --border-mid: #d1d5db;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.05);
+    --shadow: 0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.06);
   }
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  *{box-sizing:border-box;margin:0;padding:0}
 
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Yu Gothic UI', sans-serif;
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
+    font-size: 14px;
+    line-height: 1.5;
   }
 
-  /* ヘッダー */
+  /* ── ヘッダー ── */
   header {
-    background: linear-gradient(135deg, var(--surface), var(--surface2));
-    border-bottom: 1px solid var(--border);
-    padding: 24px 32px;
+    background: var(--header);
+    height: 56px;
     display: flex;
     align-items: center;
-    gap: 16px;
+    padding: 0 28px;
+    gap: 14px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.25);
+    position: sticky;
+    top: 0;
+    z-index: 10;
   }
-  header .logo { font-size: 1.8em; }
-  header h1 { font-size: 1.4em; font-weight: 700; letter-spacing: .05em; }
-  header p { font-size: .82em; color: var(--text-dim); margin-top: 2px; }
+  .hdr-icon {
+    width: 34px; height: 34px;
+    background: rgba(255,255,255,.12);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .hdr-icon svg { display: block; }
+  .hdr-title {
+    font-size: 1.05em;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: .02em;
+  }
+  .hdr-sub {
+    font-size: .75em;
+    color: rgba(255,255,255,.5);
+    margin-left: 2px;
+  }
 
-  /* メインレイアウト */
+  /* ── レイアウト ── */
   .layout {
     display: grid;
-    grid-template-columns: 260px 1fr;
-    min-height: calc(100vh - 81px);
+    grid-template-columns: 210px 1fr;
+    min-height: calc(100vh - 56px);
   }
 
-  /* サイドバー（職種選択） */
+  /* ── サイドバー ── */
   .sidebar {
     background: var(--surface);
     border-right: 1px solid var(--border);
-    padding: 24px 16px;
+    padding: 18px 10px;
+    overflow-y: auto;
   }
-  .sidebar h2 {
-    font-size: .78em;
-    color: var(--text-dim);
-    letter-spacing: .12em;
-    text-transform: uppercase;
-    margin-bottom: 12px;
-    padding-left: 8px;
-  }
-  .job-btn {
-    display: block;
-    width: 100%;
-    padding: 12px 16px;
-    margin-bottom: 4px;
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    color: var(--text);
-    font-size: .95em;
-    text-align: left;
-    cursor: pointer;
-    transition: all .2s;
-  }
-  .job-btn:hover { background: var(--surface2); border-color: var(--border); }
-  .job-btn.active {
-    background: var(--accent2);
-    border-color: var(--accent);
-    color: #fff;
-    font-weight: 600;
-  }
-  .job-btn .icon { margin-right: 8px; }
-
-  /* メインコンテンツ */
-  .main { padding: 32px; overflow-x: hidden; }
-
-  /* 初期状態 */
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    height: 60vh;
-    color: var(--text-dim);
-    text-align: center;
-  }
-  .empty-state .big-icon { font-size: 4em; margin-bottom: 16px; }
-  .empty-state h3 { font-size: 1.1em; margin-bottom: 8px; }
-  .empty-state p { font-size: .88em; }
-
-  /* 検索中プログレス */
-  .progress-section {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 24px;
-    margin-bottom: 24px;
-  }
-  .progress-section h3 {
-    font-size: .85em;
-    color: var(--text-dim);
+  .sidebar-heading {
+    font-size: .68em;
+    font-weight: 700;
+    color: var(--text-muted);
     letter-spacing: .1em;
     text-transform: uppercase;
-    margin-bottom: 16px;
+    padding: 0 8px;
+    margin-bottom: 8px;
   }
-  .site-list { display: flex; flex-direction: column; gap: 8px; }
-  .site-row {
+  .job-btn {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 10px 14px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
+    gap: 9px;
+    width: 100%;
+    padding: 8px 10px;
+    margin-bottom: 2px;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: var(--text-sub);
+    font-size: .88em;
+    text-align: left;
+    cursor: pointer;
+    transition: background .12s;
+  }
+  .job-btn:hover { background: var(--bg); }
+  .job-btn.active {
+    background: var(--primary-light);
+    color: var(--primary);
+    font-weight: 600;
+  }
+  .job-abbr {
+    width: 26px; height: 26px;
+    border-radius: 5px;
     background: var(--bg);
-    transition: all .3s;
-  }
-  .site-row.searching { border-color: #f0a500; background: rgba(240,165,0,.06); }
-  .site-row.done     { border-color: var(--green); background: rgba(0,184,148,.06); }
-  .site-row.error    { border-color: var(--accent); background: rgba(233,69,96,.06); }
-  .site-row.blocked  { border-color: #888; background: rgba(136,136,136,.06); }
-  .site-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--text-dim); flex-shrink: 0;
-    transition: background .3s;
-  }
-  .site-row.searching .site-dot { background: #f0a500; animation: pulse 1s infinite; }
-  .site-row.done     .site-dot { background: var(--green); }
-  .site-row.error    .site-dot { background: var(--accent); }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-  .site-name { font-weight: 600; font-size: .9em; min-width: 100px; }
-  .site-status { font-size: .82em; color: var(--text-dim); }
-  .site-badge-count {
-    margin-left: auto;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
     font-size: .78em;
-    padding: 2px 8px;
-    border-radius: 12px;
-    background: rgba(255,255,255,.08);
+    font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .job-btn.active .job-abbr {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
   }
 
-  /* ランキングカード */
-  .rankings { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-  @media (max-width: 900px) { .rankings { grid-template-columns: 1fr; } }
+  /* ── メイン ── */
+  .main { padding: 28px 30px; overflow-x: hidden; }
+
+  /* ── 初期状態 ── */
+  .empty {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    height: 60vh;
+    color: var(--text-muted);
+    text-align: center;
+    gap: 10px;
+  }
+  .empty-icon {
+    width: 60px; height: 60px;
+    background: var(--border);
+    border-radius: 14px;
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 4px;
+  }
+  .empty h3 { font-size: .95em; font-weight: 600; color: var(--text-sub); }
+  .empty p  { font-size: .83em; line-height: 1.7; }
+
+  /* ── プログレス ── */
+  .progress-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 18px;
+    box-shadow: var(--shadow-sm);
+  }
+  .progress-head {
+    display: flex; align-items: center; gap: 8px;
+    font-size: .78em; font-weight: 700;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin-bottom: 14px;
+  }
+  .site-rows { display: flex; flex-direction: column; gap: 5px; }
+  .site-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    transition: all .22s;
+  }
+  .site-row.searching { background: var(--warning-light); border-color: var(--warning-border); }
+  .site-row.done      { background: var(--success-light); border-color: var(--success-border); }
+  .site-row.error     { background: var(--error-light);   border-color: var(--error-border); }
+
+  .s-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--border); flex-shrink: 0;
+  }
+  .site-row.searching .s-dot { background: var(--warning); animation: blink .85s infinite; }
+  .site-row.done      .s-dot { background: var(--success); }
+  .site-row.error     .s-dot { background: var(--error); }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
+
+  .s-name   { font-size: .86em; font-weight: 600; min-width: 88px; color: var(--text-sub); }
+  .s-status { font-size: .79em; color: var(--text-muted); }
+  .s-badge  {
+    margin-left: auto; font-size: .73em; color: var(--text-muted);
+    background: rgba(0,0,0,.05); padding: 2px 8px; border-radius: 10px;
+  }
+
+  /* ── メタバー ── */
+  .meta-bar {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 16px; flex-wrap: wrap;
+  }
+  .kw-pill {
+    font-size: .83em; font-weight: 700;
+    background: var(--primary); color: #fff;
+    padding: 3px 13px; border-radius: 20px;
+  }
+  .meta-ts    { font-size: .78em; color: var(--text-muted); }
+  .meta-total { font-size: .78em; color: var(--success); font-weight: 600; margin-left: auto; }
+
+  /* ── ランキングカード ── */
+  .rankings {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+  }
+  @media(max-width:920px){ .rankings{ grid-template-columns:1fr } }
 
   .rank-card {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: 10px;
     overflow: hidden;
+    box-shadow: var(--shadow);
   }
-  .rank-header {
-    padding: 14px 20px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-weight: 700;
-    font-size: .95em;
-  }
-  .rank-header.jikyu  { background: linear-gradient(135deg, #2d1b00, #3d2800); border-bottom: 2px solid #f0a500; }
-  .rank-header.salary { background: linear-gradient(135deg, #001a0d, #002a14); border-bottom: 2px solid var(--green); }
-
-  .rank-table { width: 100%; }
-  .rank-row {
-    display: grid;
-    grid-template-columns: 44px 90px 1fr auto;
-    align-items: center;
+  .rank-head {
+    display: flex; align-items: center; gap: 8px;
     padding: 12px 16px;
+    font-size: .83em; font-weight: 700;
     border-bottom: 1px solid var(--border);
-    gap: 10px;
-    transition: background .15s;
   }
-  .rank-row:last-child { border-bottom: none; }
-  .rank-row:hover { background: rgba(255,255,255,.03); }
-  .medal { font-size: 1.4em; text-align: center; }
-  .site-tag {
-    font-size: .72em;
-    font-weight: 700;
-    padding: 3px 7px;
-    border-radius: 4px;
-    text-align: center;
-    white-space: nowrap;
+  .rank-head.t-jikyu  { background: var(--warning-light); color: var(--warning); border-bottom-color: var(--warning-border); }
+  .rank-head.t-salary { background: var(--success-light); color: var(--success); border-bottom-color: var(--success-border); }
+  .head-badge {
+    width: 20px; height: 20px; border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: .72em; font-weight: 800; flex-shrink: 0;
   }
-  .tag-Indeed        { background: #003A9B; color: #fff; }
-  .tag-エンゲージ    { background: #E8620F; color: #fff; }
-  .tag-マイナビ      { background: #E60020; color: #fff; }
-  .tag-マイナビ転職  { background: #CC0033; color: #fff; }
-  .tag-エン転職      { background: #00984F; color: #fff; }
-  .job-title  { font-size: .85em; line-height: 1.4; }
-  .job-company { font-size: .75em; color: var(--text-dim); margin-top: 2px; }
-  .salary-val {
-    font-size: .95em;
-    font-weight: 700;
-    color: var(--accent);
-    white-space: nowrap;
-    text-align: right;
-  }
-  .rank-empty {
-    padding: 32px;
-    text-align: center;
-    color: var(--text-dim);
-    font-size: .88em;
-  }
+  .t-jikyu  .head-badge { background: var(--warning-border); color: var(--warning); }
+  .t-salary .head-badge { background: var(--success-border); color: var(--success); }
 
-  /* メタ情報 */
-  .meta-bar {
-    display: flex;
+  .rank-item {
+    display: grid;
+    grid-template-columns: 38px 82px 1fr auto;
     align-items: center;
-    gap: 12px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
+    padding: 10px 14px; gap: 8px;
+    border-bottom: 1px solid var(--border);
+    transition: background .1s;
   }
-  .meta-bar .keyword-tag {
-    font-size: 1em;
-    font-weight: 700;
-    background: var(--accent2);
-    border: 1px solid var(--accent);
-    padding: 4px 14px;
-    border-radius: 20px;
-  }
-  .meta-bar .timestamp { font-size: .82em; color: var(--text-dim); }
-  .meta-bar .total-count { font-size: .82em; color: var(--green); margin-left: auto; }
+  .rank-item:last-child { border-bottom: none; }
+  .rank-item:hover { background: var(--bg); }
 
-  /* ローディングスピナー */
-  .spinner {
-    display: inline-block;
-    width: 14px; height: 14px;
-    border: 2px solid rgba(255,255,255,.2);
-    border-top-color: #f0a500;
-    border-radius: 50%;
-    animation: spin .7s linear infinite;
-    margin-right: 6px;
+  .rank-num {
+    width: 26px; height: 26px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: .75em; font-weight: 800; margin: 0 auto;
+    flex-shrink: 0;
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  .n1 { background: #fef3c7; color: #92400e; border: 2px solid #f59e0b; }
+  .n2 { background: #f1f5f9; color: #475569; border: 2px solid #94a3b8; }
+  .n3 { background: #fdf4e7; color: #7c3a00; border: 2px solid #d97706; }
+  .n4,.n5 { background: #f9fafb; color: #9ca3af; border: 2px solid #e5e7eb; }
 
+  .site-tag {
+    font-size: .67em; font-weight: 700;
+    padding: 2px 6px; border-radius: 4px;
+    text-align: center; white-space: nowrap;
+  }
+  .tag-Indeed       { background: #1a56db; color: #fff; }
+  .tag-エンゲージ   { background: #e8620f; color: #fff; }
+  .tag-マイナビ     { background: #e60020; color: #fff; }
+  .tag-マイナビ転職 { background: #cc0033; color: #fff; }
+  .tag-エン転職     { background: #059669; color: #fff; }
+
+  .job-title   { font-size: .83em; line-height: 1.4; color: var(--text); }
+  .job-company { font-size: .73em; color: var(--text-muted); margin-top: 2px; }
+  .salary-val  { font-size: .9em; font-weight: 700; color: var(--primary); white-space: nowrap; text-align: right; }
+
+  .rank-empty { padding: 28px 16px; text-align: center; color: var(--text-muted); font-size: .84em; }
+
+  /* ── ノート ── */
   .note {
-    font-size: .78em;
-    color: var(--text-dim);
-    margin-top: 16px;
-    padding: 10px 14px;
-    border-left: 3px solid var(--border);
+    font-size: .75em; color: var(--text-muted);
+    margin-top: 16px; padding: 9px 12px;
+    background: var(--surface);
+    border-left: 3px solid var(--border-mid);
+    border-radius: 0 6px 6px 0;
+  }
+
+  /* ── スピナー ── */
+  .spinner {
+    display: inline-block; width: 11px; height: 11px;
+    border: 2px solid var(--border-mid);
+    border-top-color: var(--primary);
+    border-radius: 50%;
+    animation: spin .65s linear infinite;
+  }
+  @keyframes spin{ to{ transform:rotate(360deg) } }
+  .done-mark {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; border-radius: 50%;
+    background: var(--success); color: #fff;
+    font-size: 9px; font-weight: 800; flex-shrink: 0;
   }
 </style>
 </head>
 <body>
 
 <header>
-  <div class="logo">📊</div>
-  <div>
-    <h1>求人給与ランキング</h1>
-    <p>Indeed / エンゲージ / マイナビ / マイナビ転職 / エン転職 — リアルタイム集計</p>
+  <div class="hdr-icon">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+         stroke="rgba(255,255,255,.9)" stroke-width="2.2"
+         stroke-linecap="round" stroke-linejoin="round">
+      <rect x="18" y="3" width="4" height="18"/>
+      <rect x="10" y="8" width="4" height="13"/>
+      <rect x="2"  y="13" width="4" height="8"/>
+    </svg>
   </div>
+  <span class="hdr-title">求人給与ランキング</span>
+  <span class="hdr-sub">Indeed / エンゲージ / マイナビ / マイナビ転職 / エン転職</span>
 </header>
 
 <div class="layout">
 
-  <!-- サイドバー -->
   <aside class="sidebar">
-    <h2>職種を選択</h2>
+    <div class="sidebar-heading">職種を選択</div>
     <div id="jobButtons"></div>
   </aside>
 
-  <!-- メインコンテンツ -->
   <main class="main" id="main">
-    <div class="empty-state" id="emptyState">
-      <div class="big-icon">🔍</div>
+    <div class="empty">
+      <div class="empty-icon">
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none"
+             stroke="#9ca3af" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+      </div>
       <h3>職種を選んでください</h3>
-      <p>左のリストから職種を選ぶと<br>自動でランキングを集計します</p>
+      <p>左のリストから職種を選ぶと<br>リアルタイムでランキングを集計します</p>
     </div>
   </main>
 
@@ -641,140 +847,124 @@ HTML = """<!DOCTYPE html>
 
 <script>
 const JOBS = [
-  ["💼", "営業職"],   ["🖥", "事務職"],    ["⚙️", "エンジニア"],
-  ["🛍", "販売・接客"],["🏭", "製造・工場"],["🏥", "介護・福祉"],
-  ["🚚", "ドライバー"],["📦", "軽作業"],    ["🩺", "医療・看護"],
-  ["🎨", "デザイナー"]
+  ["営","営業職"],["事","事務職"],["エ","エンジニア"],
+  ["販","販売・接客"],["製","製造・工場"],["介","介護・福祉"],
+  ["ド","ドライバー"],["軽","軽作業"],["医","医療・看護"],["デ","デザイナー"]
 ];
+const SITES = ["Indeed","エンゲージ","マイナビ","マイナビ転職","エン転職"];
+const RANK_CLS = ["n1","n2","n3","n4","n5"];
 
-const MEDALS = ["🥇","🥈","🥉","4位","5位"];
-const SITES  = ["Indeed","エンゲージ","マイナビ","マイナビ転職","エン転職"];
+let es = null;
 
-let currentES = null;
-let currentKeyword = null;
-
-// ── 職種ボタンを生成 ──
-const jobBtns = document.getElementById("jobButtons");
-JOBS.forEach(([icon, name]) => {
-  const btn = document.createElement("button");
-  btn.className = "job-btn";
-  btn.dataset.keyword = name;
-  btn.innerHTML = `<span class="icon">${icon}</span>${name}`;
-  btn.onclick = () => startSearch(name);
-  jobBtns.appendChild(btn);
+const btnArea = document.getElementById("jobButtons");
+JOBS.forEach(([abbr, name]) => {
+  const b = document.createElement("button");
+  b.className = "job-btn";
+  b.dataset.kw = name;
+  b.innerHTML = `<span class="job-abbr">${abbr}</span>${name}`;
+  b.onclick = () => go(name);
+  btnArea.appendChild(b);
 });
 
-function setActiveBtn(keyword) {
-  document.querySelectorAll(".job-btn").forEach(b => {
-    b.classList.toggle("active", b.dataset.keyword === keyword);
-  });
+function setActive(kw) {
+  document.querySelectorAll(".job-btn").forEach(b =>
+    b.classList.toggle("active", b.dataset.kw === kw));
 }
 
-// ── 検索開始 ──
-function startSearch(keyword) {
-  if (currentES) { currentES.close(); currentES = null; }
-  currentKeyword = keyword;
-  setActiveBtn(keyword);
-
-  const main = document.getElementById("main");
-  main.innerHTML = buildLoadingUI(keyword);
-
-  currentES = new EventSource(`/search?keyword=${encodeURIComponent(keyword)}`);
-
-  currentES.onmessage = (e) => {
-    const data = JSON.parse(e.data);
-    if (data.type === "progress") handleProgress(data);
-    else if (data.type === "result") handleResult(data, keyword);
-    else if (data.type === "end") { currentES.close(); currentES = null; }
+function go(kw) {
+  if (es) { es.close(); es = null; }
+  setActive(kw);
+  document.getElementById("main").innerHTML = loadingUI(kw);
+  es = new EventSource("/search?keyword=" + encodeURIComponent(kw));
+  es.onmessage = ev => {
+    const d = JSON.parse(ev.data);
+    if (d.type === "progress") onProg(d);
+    else if (d.type === "result") onResult(d, kw);
+    else if (d.type === "end") { es.close(); es = null; }
   };
-
-  currentES.onerror = () => {
-    currentES.close(); currentES = null;
-    const row = document.querySelector(".site-row.searching");
-    if (row) { row.className = "site-row error"; row.querySelector(".site-status").textContent = "接続エラー"; }
+  es.onerror = () => {
+    const r = document.querySelector(".site-row.searching");
+    if (r) r.className = "site-row error";
+    es.close(); es = null;
   };
 }
 
-// ── ローディングUI ──
-function buildLoadingUI(keyword) {
-  const rows = SITES.map(s =>
-    `<div class="site-row" id="row-${s}">
-      <div class="site-dot"></div>
-      <div class="site-name">${s}</div>
-      <div class="site-status">待機中</div>
-    </div>`
-  ).join("");
+function loadingUI(kw) {
   return `
-    <div class="progress-section">
-      <h3><span class="spinner"></span>「${keyword}」を検索中...</h3>
-      <div class="site-list">${rows}</div>
+  <div class="progress-card">
+    <div class="progress-head"><span class="spinner"></span>&nbsp;「${x(kw)}」を検索中</div>
+    <div class="site-rows">${SITES.map(s => `
+      <div class="site-row" id="r-${s}">
+        <div class="s-dot"></div>
+        <div class="s-name">${s}</div>
+        <div class="s-status">待機中</div>
+      </div>`).join("")}
     </div>
-    <div id="rankingArea"></div>`;
+  </div>
+  <div id="ra"></div>`;
 }
 
-// ── プログレス更新 ──
-function handleProgress(data) {
-  const row = document.getElementById(`row-${data.site}`);
-  if (!row) return;
-  if (data.status === "searching") {
-    row.className = "site-row searching";
-    row.querySelector(".site-status").textContent = "検索中...";
-  } else if (data.status === "done") {
-    row.className = "site-row done";
-    row.querySelector(".site-status").textContent = `${data.count}件取得`;
-    row.innerHTML += `<div class="site-badge-count">${data.salary_count}件 給与あり</div>`;
-  } else if (data.status === "error" || data.status === "blocked") {
-    row.className = "site-row error";
-    row.querySelector(".site-status").textContent = "スキップ";
+function onProg(d) {
+  const r = document.getElementById("r-" + d.site);
+  if (!r) return;
+  if (d.status === "searching") {
+    r.className = "site-row searching";
+    r.querySelector(".s-status").textContent = "検索中...";
+  } else if (d.status === "done") {
+    r.className = "site-row done";
+    r.querySelector(".s-status").textContent = d.count + "件取得";
+    r.insertAdjacentHTML("beforeend",
+      `<div class="s-badge">${d.salary_count}件 給与あり</div>`);
+  } else {
+    r.className = "site-row error";
+    r.querySelector(".s-status").textContent = "取得できませんでした";
   }
 }
 
-// ── 結果表示 ──
-function handleResult(data, keyword) {
-  // プログレスヘッダーを完了に
-  const h3 = document.querySelector(".progress-section h3");
-  if (h3) h3.innerHTML = `✅ 収集完了`;
-
-  const area = document.getElementById("rankingArea");
-  area.innerHTML = `
+function onResult(d, kw) {
+  const ph = document.querySelector(".progress-head");
+  if (ph) ph.innerHTML = '<span class="done-mark">&#10003;</span>&nbsp;収集完了';
+  document.getElementById("ra").innerHTML = `
     <div class="meta-bar">
-      <span class="keyword-tag">📌 ${keyword}</span>
-      <span class="timestamp">${data.timestamp}</span>
-      <span class="total-count">合計 ${data.total} 件収集</span>
+      <span class="kw-pill">${x(kw)}</span>
+      <span class="meta-ts">${d.timestamp}</span>
+      <span class="meta-total">合計 ${d.total} 件収集</span>
     </div>
     <div class="rankings">
-      ${buildRankCard("⏱ 時給ランキング TOP5", "jikyu", data.jikyu_ranking)}
-      ${buildRankCard("💴 給与ランキング TOP5（時給換算）", "salary", data.salary_ranking)}
+      ${card("時給ランキング TOP5","jikyu",d.jikyu_ranking)}
+      ${card("給与ランキング TOP5（時給換算）","salary",d.salary_ranking)}
     </div>
     <div class="note">
       ※ 月給・年収は月160時間勤務換算で時給に変換して比較しています。<br>
-      ※ Indeed は短時間の連続アクセスでブロックされることがあります（通常使用では問題ありません）。
+      ※ Indeed はクラウドサーバーからのアクセスでブロックされる場合があります。
     </div>`;
 }
 
-function buildRankCard(title, type, jobs) {
-  const rows = jobs.length === 0
-    ? `<div class="rank-empty">給与情報を含む求人が取得できませんでした</div>`
-    : jobs.map((j, i) => `
-        <div class="rank-row">
-          <div class="medal">${MEDALS[i]}</div>
-          <div><span class="site-tag tag-${j.site}">${j.site}</span></div>
-          <div>
-            <div class="job-title">${escHtml(j.title)}</div>
-            ${j.company ? `<div class="job-company">${escHtml(j.company)}</div>` : ""}
-          </div>
-          <div class="salary-val">${escHtml(j.salary)}</div>
-        </div>`
-      ).join("");
+function card(title, type, jobs) {
+  const badge = type === "jikyu" ? "時" : "給";
+  const rows = jobs.length
+    ? jobs.map((j,i) => `
+      <div class="rank-item">
+        <div class="rank-num ${RANK_CLS[i]}">${i+1}</div>
+        <div><span class="site-tag tag-${j.site}">${j.site}</span></div>
+        <div>
+          <div class="job-title">${x(j.title)}</div>
+          ${j.company ? `<div class="job-company">${x(j.company)}</div>` : ""}
+        </div>
+        <div class="salary-val">${x(j.salary)}</div>
+      </div>`).join("")
+    : `<div class="rank-empty">給与情報を含む求人が取得できませんでした</div>`;
 
   return `
-    <div class="rank-card">
-      <div class="rank-header ${type}">${title}</div>
-      <div class="rank-table">${rows}</div>
-    </div>`;
+  <div class="rank-card">
+    <div class="rank-head t-${type}">
+      <div class="head-badge">${badge}</div>${x(title)}
+    </div>
+    <div>${rows}</div>
+  </div>`;
 }
 
-function escHtml(s) {
+function x(s) {
   return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 </script>
@@ -785,7 +975,7 @@ function escHtml(s) {
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8080))
-    is_local = os.environ.get("RENDER") is None  # Render上ではRENDER環境変数が設定される
+    is_local = os.environ.get("RENDER") is None
 
     print("\n" + "=" * 50)
     print("  求人給与ランキング Webアプリ 起動中...")
@@ -793,7 +983,7 @@ if __name__ == "__main__":
     if is_local:
         print(f"  ブラウザで開く → http://localhost:{port}")
         print("  停止: Ctrl+C")
-        import subprocess, time, threading
+        import subprocess, time
         def open_browser():
             time.sleep(1.5)
             subprocess.run(["open", f"http://localhost:{port}"])
