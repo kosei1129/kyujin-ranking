@@ -26,6 +26,8 @@ except ImportError:
 
 app = Flask(__name__)
 
+MAX_PAGES = 10   # 各サイト最大何ページ取得するか
+
 SHOKUSHU_LIST = [
     "営業職", "事務職", "エンジニア", "販売・接客",
     "製造・工場", "介護・福祉", "ドライバー", "軽作業",
@@ -113,7 +115,7 @@ NOISE = re.compile(
     r"トップ|ホーム|ナビ|メニュー|詳細|確認|\d+件|\d+ページ)$"
 )
 
-def extract_jobs_from_text(text: str, site_name: str, max_jobs: int = 20) -> list:
+def extract_jobs_from_text(text: str, site_name: str, max_jobs: int = 9999) -> list:
     jobs = []
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     for i, line in enumerate(lines):
@@ -241,16 +243,12 @@ def http_scrape_indeed(keyword: str) -> list:
 
 
 
-def http_scrape_mynavi_tenshoku(keyword: str) -> list:
+def _extract_mynavi_t(soup: BeautifulSoup) -> list:
     jobs = []
-    url = f"https://tenshoku.mynavi.jp/list/?keyword={urllib.parse.quote(keyword)}"
-    soup = _fetch(url, referer="https://tenshoku.mynavi.jp/")
-    if soup is None:
-        return jobs
     cards = soup.select(".cassetteRecruit, [class*='cassetteRecruit']")
     if not cards:
         cards = soup.select("article, [class*='recruit'], [class*='Recruit']")
-    for card in cards[:30]:
+    for card in cards:
         he = card.select_one(".cassetteRecruit__heading, [class*='heading'], [class*='Heading']")
         title, company = "", ""
         if he:
@@ -274,21 +272,44 @@ def http_scrape_mynavi_tenshoku(keyword: str) -> list:
         if title:
             jobs.append({"site": "マイナビ転職", "title": title,
                          "company": company, "location": "", "salary_text": salary})
-    if not jobs:
+    return jobs
+
+
+def _fetch_mynavi_t_page(keyword: str, page: int) -> list:
+    url = (f"https://tenshoku.mynavi.jp/list/?keyword={urllib.parse.quote(keyword)}"
+           if page == 1 else
+           f"https://tenshoku.mynavi.jp/list/?keyword={urllib.parse.quote(keyword)}&p={page}")
+    soup = _fetch(url, referer="https://tenshoku.mynavi.jp/")
+    if not soup:
+        return []
+    jobs = _extract_mynavi_t(soup)
+    if not jobs and page == 1:
         jobs = extract_jobs_from_text(soup.get_text("\n", strip=True), "マイナビ転職")
     return jobs
 
 
-def http_scrape_en_tenshoku(keyword: str) -> list:
+def http_scrape_mynavi_tenshoku(keyword: str) -> list:
+    # 全ページを同時フェッチ
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=MAX_PAGES) as ex:
+        futures = [ex.submit(_fetch_mynavi_t_page, keyword, pg)
+                   for pg in range(1, MAX_PAGES + 1)]
+        pages = [f.result() for f in futures]
+    seen, all_jobs = set(), []
+    for jobs in pages:
+        for j in jobs:
+            if j["title"] not in seen:
+                seen.add(j["title"])
+                all_jobs.append(j)
+    return all_jobs
+
+
+def _extract_en_tenshoku(soup: BeautifulSoup) -> list:
     jobs = []
-    url = f"https://employment.en-japan.com/keyword/{urllib.parse.quote(keyword, safe='')}/"
-    soup = _fetch(url, referer="https://employment.en-japan.com/")
-    if soup is None:
-        return jobs
     cards = soup.select(".jobSearchListUnit, [class*='jobSearchList'], [class*='job-unit']")
     if not cards:
         cards = soup.select("article, li[class*='item']")
-    for card in cards[:30]:
+    for card in cards:
         te = card.select_one(".jobNameText, [class*='jobName'], h2 a, h3 a")
         ce = card.select_one(".company, [class*='companyName'], [class*='company']")
         title = te.get_text(strip=True) if te else ""
@@ -305,9 +326,36 @@ def http_scrape_en_tenshoku(keyword: str) -> list:
         if title:
             jobs.append({"site": "エン転職", "title": title,
                          "company": company, "location": "", "salary_text": salary})
-    if not jobs:
+    return jobs
+
+
+def _fetch_en_tenshoku_page(keyword: str, page: int) -> list:
+    url = (f"https://employment.en-japan.com/keyword/{urllib.parse.quote(keyword, safe='')}/"
+           if page == 1 else
+           f"https://employment.en-japan.com/keyword/{urllib.parse.quote(keyword, safe='')}/{page}/")
+    soup = _fetch(url, referer="https://employment.en-japan.com/")
+    if not soup:
+        return []
+    jobs = _extract_en_tenshoku(soup)
+    if not jobs and page == 1:
         jobs = extract_jobs_from_text(soup.get_text("\n", strip=True), "エン転職")
     return jobs
+
+
+def http_scrape_en_tenshoku(keyword: str) -> list:
+    # 全ページを同時フェッチ
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=MAX_PAGES) as ex:
+        futures = [ex.submit(_fetch_en_tenshoku_page, keyword, pg)
+                   for pg in range(1, MAX_PAGES + 1)]
+        pages = [f.result() for f in futures]
+    seen, all_jobs = set(), []
+    for jobs in pages:
+        for j in jobs:
+            if j["title"] not in seen:
+                seen.add(j["title"])
+                all_jobs.append(j)
+    return all_jobs
 
 
 # ─────────────────────────────────────────
@@ -346,75 +394,107 @@ async def playwright_scrape_indeed(page, keyword: str) -> list:
 
 
 async def playwright_scrape_engage(page, keyword: str) -> list:
-    """エンゲージ：React SPA なので Playwright + networkidle で完全読み込みを待つ"""
-    jobs = []
+    """エンゲージ：React SPA なので Playwright + networkidle で完全読み込みを待つ（全ページ取得）"""
+    all_jobs = []
+    seen: set = set()
     try:
-        url = f"https://en-gage.net/user/search/?searchWord={urllib.parse.quote(keyword)}"
-        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=12000)
-        except Exception:
-            pass
-        await page.wait_for_timeout(3000)
-
-        # カードセレクタ
-        cards = await page.query_selector_all(
-            "article, [class*='jobCard'], [class*='job-card'], [class*='JobCard'],"
-            "[class*='search-result'], [class*='SearchResult']"
-        )
-        for card in cards[:25]:
+        for pg in range(1, MAX_PAGES + 1):
+            url = (f"https://en-gage.net/user/search/?searchWord={urllib.parse.quote(keyword)}"
+                   if pg == 1 else
+                   f"https://en-gage.net/user/search/?searchWord={urllib.parse.quote(keyword)}&page={pg}")
+            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
             try:
-                te = await card.query_selector("h2,h3,[class*='title'],[class*='Title']")
-                title = (await te.inner_text()).strip() if te else ""
-                card_text = (await card.inner_text()).strip()
-                salary = ""
-                m = re.search(r"(時給|月給|年収)[^\d]*\d[\d,万円〜]+", card_text)
-                if m:
-                    salary = m.group(0)
-                if title:
-                    jobs.append({"site": "エンゲージ", "title": title,
-                                 "company": "", "location": "", "salary_text": salary})
+                await page.wait_for_load_state("networkidle", timeout=12000)
             except Exception:
-                continue
+                pass
+            await page.wait_for_timeout(2000)
 
-        if not jobs:
-            body = await page.inner_text("body")
-            jobs = extract_jobs_from_text(body, "エンゲージ")
+            cards = await page.query_selector_all(
+                "article, [class*='jobCard'], [class*='job-card'], [class*='JobCard'],"
+                "[class*='search-result'], [class*='SearchResult']"
+            )
+            page_jobs = []
+            for card in cards:
+                try:
+                    te = await card.query_selector("h2,h3,[class*='title'],[class*='Title']")
+                    title = (await te.inner_text()).strip() if te else ""
+                    card_text = (await card.inner_text()).strip()
+                    salary = ""
+                    m = re.search(r"(時給|月給|年収)[^\d]*\d[\d,万円〜]+", card_text)
+                    if m:
+                        salary = m.group(0)
+                    if title and title not in seen:
+                        seen.add(title)
+                        page_jobs.append({"site": "エンゲージ", "title": title,
+                                          "company": "", "location": "", "salary_text": salary})
+                except Exception:
+                    continue
+
+            if not page_jobs and pg == 1:
+                body = await page.inner_text("body")
+                fallback = extract_jobs_from_text(body, "エンゲージ")
+                for j in fallback:
+                    if j["title"] not in seen:
+                        seen.add(j["title"])
+                        all_jobs.append(j)
+                break
+
+            all_jobs.extend(page_jobs)
+            if not page_jobs:
+                break  # これ以上ページなし
     except Exception:
         pass
-    return jobs
+    return all_jobs
 
 
 async def playwright_scrape_mynavi_baito(page, keyword: str) -> list:
-    jobs = []
+    all_jobs = []
+    seen: set = set()
     try:
         word = keyword.replace("職", "").replace("・", "")
-        await page.goto(f"https://baito.mynavi.jp/ai/word_{word}/",
-                        timeout=30000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
-        for card in await page.query_selector_all(".tabJobOfferCard"):
-            try:
-                lines = [l.strip() for l in (await card.inner_text()).split("\n") if l.strip()]
-                if len(lines) < 2:
+        base_url = f"https://baito.mynavi.jp/ai/word_{word}/"
+
+        for pg in range(1, MAX_PAGES + 1):
+            url = base_url if pg == 1 else f"{base_url}?p={pg}"
+            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2500)
+
+            cards = await page.query_selector_all(".tabJobOfferCard")
+            page_jobs = []
+            for card in cards:
+                try:
+                    lines = [l.strip() for l in (await card.inner_text()).split("\n") if l.strip()]
+                    if len(lines) < 2:
+                        continue
+                    company = re.sub(r"/\d+$", "", lines[0]).strip()
+                    title = lines[1]
+                    salary_text = ""
+                    for i, line in enumerate(lines):
+                        if line == "給与" and i + 1 < len(lines):
+                            salary_text = lines[i + 1]
+                            break
+                    if title and title not in seen:
+                        seen.add(title)
+                        page_jobs.append({"site": "マイナビ", "title": title,
+                                          "company": company, "location": "", "salary_text": salary_text})
+                except Exception:
                     continue
-                company = re.sub(r"/\d+$", "", lines[0]).strip()
-                title = lines[1]
-                salary_text = ""
-                for i, line in enumerate(lines):
-                    if line == "給与" and i + 1 < len(lines):
-                        salary_text = lines[i + 1]
-                        break
-                if title:
-                    jobs.append({"site": "マイナビ", "title": title,
-                                 "company": company, "location": "", "salary_text": salary_text})
-            except Exception:
-                continue
-        if not jobs:
-            body = await page.inner_text("body")
-            jobs = extract_jobs_from_text(body, "マイナビ")
+
+            if not page_jobs and pg == 1:
+                body = await page.inner_text("body")
+                fallback = extract_jobs_from_text(body, "マイナビ")
+                for j in fallback:
+                    if j["title"] not in seen:
+                        seen.add(j["title"])
+                        all_jobs.append(j)
+                break
+
+            all_jobs.extend(page_jobs)
+            if not page_jobs:
+                break
     except Exception:
         pass
-    return jobs
+    return all_jobs
 
 
 # ─────────────────────────────────────────
