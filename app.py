@@ -10,6 +10,7 @@ import queue
 import re
 import threading
 import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 import requests
@@ -146,50 +147,56 @@ def _fetch(url: str, referer: str = "https://www.google.co.jp/") -> BeautifulSou
 
 def http_scrape_indeed(keyword: str) -> list:
     jobs = []
-    url = f"https://jp.indeed.com/jobs?q={urllib.parse.quote(keyword)}&sort=date&limit=20"
-    soup = _fetch(url)
-    if soup is None:
-        return jobs
-    for card in soup.select("div.job_seen_beacon, div[data-jk]")[:20]:
-        te = card.select_one("h2.jobTitle span, h2 a span")
-        ce = card.select_one("[data-testid='company-name'], .companyName")
-        se = card.select_one(
-            "[data-testid='attribute_snippet_testid'], .salary-snippet-container, [class*='salary']")
-        title = te.get_text(strip=True) if te else ""
-        if title:
-            jobs.append({"site": "Indeed", "title": title,
-                         "company": ce.get_text(strip=True) if ce else "",
-                         "location": "",
-                         "salary_text": se.get_text(strip=True) if se else ""})
-    if not jobs and soup:
-        jobs = extract_jobs_from_text(soup.get_text("\n", strip=True), "Indeed")
+
+    # RSS フィード（Cloudflare を回避しやすい）
+    try:
+        rss_url = f"https://jp.indeed.com/rss?q={urllib.parse.quote(keyword)}&sort=date&limit=25"
+        resp = _http.get(
+            rss_url, timeout=20,
+            headers={"Accept": "application/rss+xml,application/xml,text/xml",
+                     "Referer": "https://jp.indeed.com/"},
+        )
+        if resp.status_code == 200 and ("<rss" in resp.text or "<feed" in resp.text):
+            root = ET.fromstring(resp.content)
+            for item in root.findall(".//item")[:25]:
+                title_raw = item.findtext("title", "")
+                desc_html = item.findtext("description", "")
+                desc_text = (BeautifulSoup(desc_html, "html.parser").get_text("\n", strip=True)
+                             if desc_html else "")
+                title, company = title_raw, ""
+                if " - " in title_raw:
+                    parts = title_raw.rsplit(" - ", 1)
+                    title = parts[0].strip()
+                    company = re.sub(r"\s*\([^)]+\)\s*$", "", parts[1]).strip()
+                salary = ""
+                m = re.search(r"(時給|月給|年収)[^\d]*\d[\d,万円]+", desc_text)
+                if m:
+                    salary = m.group(0)
+                if title:
+                    jobs.append({"site": "Indeed", "title": title,
+                                 "company": company, "location": "", "salary_text": salary})
+            if jobs:
+                return jobs
+    except Exception:
+        pass
+
+    # フォールバック：通常ページ
+    soup = _fetch(f"https://jp.indeed.com/jobs?q={urllib.parse.quote(keyword)}&sort=date&limit=20")
+    if soup:
+        for card in soup.select("div.job_seen_beacon, div[data-jk]")[:20]:
+            te = card.select_one("h2.jobTitle span, h2 a span")
+            ce = card.select_one("[data-testid='company-name'], .companyName")
+            se = card.select_one("[data-testid='attribute_snippet_testid'], [class*='salary']")
+            title = te.get_text(strip=True) if te else ""
+            if title:
+                jobs.append({"site": "Indeed", "title": title,
+                             "company": ce.get_text(strip=True) if ce else "",
+                             "location": "",
+                             "salary_text": se.get_text(strip=True) if se else ""})
+        if not jobs:
+            jobs = extract_jobs_from_text(soup.get_text("\n", strip=True), "Indeed")
     return jobs
 
-
-def http_scrape_engage(keyword: str) -> list:
-    jobs = []
-    url = f"https://en-gage.net/user/search/?searchWord={urllib.parse.quote(keyword)}"
-    soup = _fetch(url)
-    if soup is None:
-        return jobs
-    # SPA チェック：本文に求人データがあるか
-    text = soup.get_text("\n", strip=True)
-    cards = soup.select("article, [class*='jobCard'], [class*='job-card'], [class*='Job']")
-    for card in cards[:20]:
-        te = card.select_one("h2, h3, [class*='title'], [class*='Title']")
-        se = card.select_one("[class*='salary'], [class*='Salary'], [class*='wage']")
-        title = te.get_text(strip=True) if te else ""
-        salary = se.get_text(strip=True) if se else ""
-        if not salary:
-            m = re.search(r"(時給|月給|年収)[^\d]*\d[\d,万円]+", card.get_text("\n", strip=True))
-            if m:
-                salary = m.group(0)
-        if title:
-            jobs.append({"site": "エンゲージ", "title": title,
-                         "company": "", "location": "", "salary_text": salary})
-    if not jobs:
-        jobs = extract_jobs_from_text(text, "エンゲージ")
-    return jobs
 
 
 def http_scrape_mynavi_tenshoku(keyword: str) -> list:
@@ -262,8 +269,48 @@ def http_scrape_en_tenshoku(keyword: str) -> list:
 
 
 # ─────────────────────────────────────────
-# Playwright スクレイパー（マイナビバイトのみ + fallback）
+# Playwright スクレイパー（SPA サイト）
 # ─────────────────────────────────────────
+
+async def playwright_scrape_engage(page, keyword: str) -> list:
+    """エンゲージ：React SPA なので Playwright + networkidle で完全読み込みを待つ"""
+    jobs = []
+    try:
+        url = f"https://en-gage.net/user/search/?searchWord={urllib.parse.quote(keyword)}"
+        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=12000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(3000)
+
+        # カードセレクタ
+        cards = await page.query_selector_all(
+            "article, [class*='jobCard'], [class*='job-card'], [class*='JobCard'],"
+            "[class*='search-result'], [class*='SearchResult']"
+        )
+        for card in cards[:25]:
+            try:
+                te = await card.query_selector("h2,h3,[class*='title'],[class*='Title']")
+                title = (await te.inner_text()).strip() if te else ""
+                card_text = (await card.inner_text()).strip()
+                salary = ""
+                m = re.search(r"(時給|月給|年収)[^\d]*\d[\d,万円〜]+", card_text)
+                if m:
+                    salary = m.group(0)
+                if title:
+                    jobs.append({"site": "エンゲージ", "title": title,
+                                 "company": "", "location": "", "salary_text": salary})
+            except Exception:
+                continue
+
+        if not jobs:
+            body = await page.inner_text("body")
+            jobs = extract_jobs_from_text(body, "エンゲージ")
+    except Exception:
+        pass
+    return jobs
+
 
 async def playwright_scrape_mynavi_baito(page, keyword: str) -> list:
     jobs = []
@@ -307,7 +354,6 @@ async def run_scraper(keyword: str, q: queue.Queue):
     # ── HTTP スクレイパー（requests）──
     http_scrapers = [
         ("Indeed",      http_scrape_indeed),
-        ("エンゲージ",   http_scrape_engage),
         ("マイナビ転職", http_scrape_mynavi_tenshoku),
         ("エン転職",     http_scrape_en_tenshoku),
     ]
@@ -324,8 +370,10 @@ async def run_scraper(keyword: str, q: queue.Queue):
             q.put({"type": "progress", "site": site_name, "status": "error", "msg": str(e)})
         await asyncio.sleep(0.5)
 
-    # ── Playwright スクレイパー（マイナビバイト）──
+    # ── Playwright スクレイパー（マイナビバイト + エンゲージ）──
     q.put({"type": "progress", "site": "マイナビ", "status": "searching"})
+    q.put({"type": "progress", "site": "エンゲージ", "status": "searching"})
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -348,9 +396,11 @@ async def run_scraper(keyword: str, q: queue.Queue):
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
             "window.chrome={runtime:{}};"
         )
-        page = await context.new_page()
+
+        # マイナビバイト
+        page1 = await context.new_page()
         try:
-            jobs = await playwright_scrape_mynavi_baito(page, keyword)
+            jobs = await playwright_scrape_mynavi_baito(page1, keyword)
             all_jobs.extend(jobs)
             salary_count = sum(1 for j in jobs if j["salary_text"])
             q.put({"type": "progress", "site": "マイナビ",
@@ -358,7 +408,21 @@ async def run_scraper(keyword: str, q: queue.Queue):
         except Exception as e:
             q.put({"type": "progress", "site": "マイナビ", "status": "error", "msg": str(e)})
         finally:
-            await page.close()
+            await page1.close()
+
+        # エンゲージ
+        page2 = await context.new_page()
+        try:
+            jobs = await playwright_scrape_engage(page2, keyword)
+            all_jobs.extend(jobs)
+            salary_count = sum(1 for j in jobs if j["salary_text"])
+            q.put({"type": "progress", "site": "エンゲージ",
+                   "status": "done", "count": len(jobs), "salary_count": salary_count})
+        except Exception as e:
+            q.put({"type": "progress", "site": "エンゲージ", "status": "error", "msg": str(e)})
+        finally:
+            await page2.close()
+
         await browser.close()
 
     # ランキング計算
