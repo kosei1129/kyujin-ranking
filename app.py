@@ -18,6 +18,12 @@ from bs4 import BeautifulSoup
 from flask import Flask, Response, render_template_string, request, stream_with_context
 from playwright.async_api import async_playwright
 
+try:
+    from curl_cffi import requests as cffi_req
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
+
 app = Flask(__name__)
 
 SHOKUSHU_LIST = [
@@ -145,57 +151,93 @@ def _fetch(url: str, referer: str = "https://www.google.co.jp/") -> BeautifulSou
         return None
 
 
-def http_scrape_indeed(keyword: str) -> list:
+def _parse_indeed_rss(text: str) -> list:
     jobs = []
-
-    # RSS フィード（Cloudflare を回避しやすい）
+    if "<rss" not in text and "<feed" not in text:
+        return jobs
     try:
-        rss_url = f"https://jp.indeed.com/rss?q={urllib.parse.quote(keyword)}&sort=date&limit=25"
-        resp = _http.get(
-            rss_url, timeout=20,
-            headers={"Accept": "application/rss+xml,application/xml,text/xml",
-                     "Referer": "https://jp.indeed.com/"},
-        )
-        if resp.status_code == 200 and ("<rss" in resp.text or "<feed" in resp.text):
-            root = ET.fromstring(resp.content)
-            for item in root.findall(".//item")[:25]:
-                title_raw = item.findtext("title", "")
-                desc_html = item.findtext("description", "")
-                desc_text = (BeautifulSoup(desc_html, "html.parser").get_text("\n", strip=True)
-                             if desc_html else "")
-                title, company = title_raw, ""
-                if " - " in title_raw:
-                    parts = title_raw.rsplit(" - ", 1)
-                    title = parts[0].strip()
-                    company = re.sub(r"\s*\([^)]+\)\s*$", "", parts[1]).strip()
-                salary = ""
-                m = re.search(r"(時給|月給|年収)[^\d]*\d[\d,万円]+", desc_text)
-                if m:
-                    salary = m.group(0)
-                if title:
-                    jobs.append({"site": "Indeed", "title": title,
-                                 "company": company, "location": "", "salary_text": salary})
+        root = ET.fromstring(text.encode())
+        for item in root.findall(".//item")[:25]:
+            title_raw = item.findtext("title", "")
+            desc_html = item.findtext("description", "")
+            desc_text = (BeautifulSoup(desc_html, "html.parser").get_text("\n", strip=True)
+                         if desc_html else "")
+            title, company = title_raw, ""
+            if " - " in title_raw:
+                parts = title_raw.rsplit(" - ", 1)
+                title = parts[0].strip()
+                company = re.sub(r"\s*\([^)]+\)\s*$", "", parts[1]).strip()
+            salary = ""
+            m = re.search(r"(時給|月給|年収)[^\d]*\d[\d,万円]+", desc_text)
+            if m:
+                salary = m.group(0)
+            if title:
+                jobs.append({"site": "Indeed", "title": title,
+                             "company": company, "location": "", "salary_text": salary})
+    except Exception:
+        pass
+    return jobs
+
+
+def _parse_indeed_html(html: str) -> list:
+    jobs = []
+    soup = BeautifulSoup(html, "html.parser")
+    for card in soup.select("div.job_seen_beacon, div[data-jk]")[:20]:
+        te = card.select_one("h2.jobTitle span, h2 a span")
+        ce = card.select_one("[data-testid='company-name'], .companyName")
+        se = card.select_one("[data-testid='attribute_snippet_testid'], [class*='salary']")
+        title = te.get_text(strip=True) if te else ""
+        if title:
+            jobs.append({"site": "Indeed", "title": title,
+                         "company": ce.get_text(strip=True) if ce else "",
+                         "location": "",
+                         "salary_text": se.get_text(strip=True) if se else ""})
+    if not jobs:
+        jobs = extract_jobs_from_text(soup.get_text("\n", strip=True), "Indeed")
+    return jobs
+
+
+def http_scrape_indeed(keyword: str) -> list:
+    rss_url  = f"https://jp.indeed.com/rss?q={urllib.parse.quote(keyword)}&sort=date&limit=25"
+    html_url = f"https://jp.indeed.com/jobs?q={urllib.parse.quote(keyword)}&sort=date&limit=20"
+    rss_headers = {"Accept": "application/rss+xml,application/xml,text/xml",
+                   "Accept-Language": "ja-JP,ja;q=0.9"}
+
+    # ── curl_cffi でCloudflare TLSフィンガープリントを回避 ──
+    if HAS_CFFI:
+        for impersonate in ("chrome110", "chrome107"):
+            try:
+                resp = cffi_req.get(rss_url, impersonate=impersonate,
+                                    timeout=20, headers=rss_headers)
+                if resp.status_code == 200:
+                    jobs = _parse_indeed_rss(resp.text)
+                    if jobs:
+                        return jobs
+            except Exception:
+                pass
+        try:
+            resp = cffi_req.get(html_url, impersonate="chrome110", timeout=20,
+                                headers={"Accept-Language": "ja-JP,ja;q=0.9"})
+            if resp.status_code == 200:
+                jobs = _parse_indeed_html(resp.text)
+                if jobs:
+                    return jobs
+        except Exception:
+            pass
+
+    # ── 通常 requests フォールバック ──
+    try:
+        resp = _http.get(rss_url, timeout=20,
+                         headers={**rss_headers, "Referer": "https://jp.indeed.com/"})
+        if resp.status_code == 200:
+            jobs = _parse_indeed_rss(resp.text)
             if jobs:
                 return jobs
     except Exception:
         pass
 
-    # フォールバック：通常ページ
-    soup = _fetch(f"https://jp.indeed.com/jobs?q={urllib.parse.quote(keyword)}&sort=date&limit=20")
-    if soup:
-        for card in soup.select("div.job_seen_beacon, div[data-jk]")[:20]:
-            te = card.select_one("h2.jobTitle span, h2 a span")
-            ce = card.select_one("[data-testid='company-name'], .companyName")
-            se = card.select_one("[data-testid='attribute_snippet_testid'], [class*='salary']")
-            title = te.get_text(strip=True) if te else ""
-            if title:
-                jobs.append({"site": "Indeed", "title": title,
-                             "company": ce.get_text(strip=True) if ce else "",
-                             "location": "",
-                             "salary_text": se.get_text(strip=True) if se else ""})
-        if not jobs:
-            jobs = extract_jobs_from_text(soup.get_text("\n", strip=True), "Indeed")
-    return jobs
+    soup = _fetch(html_url)
+    return _parse_indeed_html(soup.prettify() if soup else "") if soup else []
 
 
 
