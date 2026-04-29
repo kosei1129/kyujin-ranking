@@ -314,6 +314,37 @@ def http_scrape_en_tenshoku(keyword: str) -> list:
 # Playwright スクレイパー（SPA サイト）
 # ─────────────────────────────────────────
 
+async def playwright_scrape_indeed(page, keyword: str) -> list:
+    """Indeed：Playwright で最後の試み（データセンターIPでブロックされる場合は0件）"""
+    jobs = []
+    try:
+        url = f"https://jp.indeed.com/jobs?q={urllib.parse.quote(keyword)}&sort=date&limit=20"
+        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(5000)
+        body = await page.inner_text("body")
+        title_text = await page.title()
+        if any(w in title_text + body for w in ["Security Check", "セキュリティ", "Captcha", "robot"]):
+            return jobs
+        for card in (await page.query_selector_all("div.job_seen_beacon, div[data-jk]"))[:20]:
+            try:
+                te = await card.query_selector("h2.jobTitle span, h2 a span")
+                ce = await card.query_selector("[data-testid='company-name'], .companyName")
+                se = await card.query_selector("[data-testid='attribute_snippet_testid'], [class*='salary']")
+                title = (await te.inner_text()).strip() if te else ""
+                if title:
+                    jobs.append({"site": "Indeed", "title": title,
+                                 "company": (await ce.inner_text()).strip() if ce else "",
+                                 "location": "",
+                                 "salary_text": (await se.inner_text()).strip() if se else ""})
+            except Exception:
+                continue
+        if not jobs:
+            jobs = extract_jobs_from_text(body, "Indeed")
+    except Exception:
+        pass
+    return jobs
+
+
 async def playwright_scrape_engage(page, keyword: str) -> list:
     """エンゲージ：React SPA なので Playwright + networkidle で完全読み込みを待つ"""
     jobs = []
@@ -393,9 +424,9 @@ async def playwright_scrape_mynavi_baito(page, keyword: str) -> list:
 async def run_scraper(keyword: str, q: queue.Queue):
     all_jobs = []
 
-    # ── HTTP スクレイパー（requests）──
+    # ── HTTP スクレイパー（requests / curl_cffi）──
     http_scrapers = [
-        ("Indeed",      http_scrape_indeed),
+        ("Indeed",      http_scrape_indeed),   # curl_cffi で Cloudflare 回避を試みる
         ("マイナビ転職", http_scrape_mynavi_tenshoku),
         ("エン転職",     http_scrape_en_tenshoku),
     ]
@@ -464,6 +495,23 @@ async def run_scraper(keyword: str, q: queue.Queue):
             q.put({"type": "progress", "site": "エンゲージ", "status": "error", "msg": str(e)})
         finally:
             await page2.close()
+
+        # Indeed（HTTPで0件だった場合、Playwright でも試みる）
+        indeed_http_count = sum(1 for j in all_jobs if j["site"] == "Indeed")
+        if indeed_http_count == 0:
+            page3 = await context.new_page()
+            try:
+                jobs = await playwright_scrape_indeed(page3, keyword)
+                if jobs:
+                    # HTTP 側で既に progress を送っているので件数を上書き通知
+                    all_jobs.extend(jobs)
+                    salary_count = sum(1 for j in jobs if j["salary_text"])
+                    q.put({"type": "progress", "site": "Indeed",
+                           "status": "done", "count": len(jobs), "salary_count": salary_count})
+            except Exception:
+                pass
+            finally:
+                await page3.close()
 
         await browser.close()
 
@@ -726,7 +774,7 @@ HTML = """<!DOCTYPE html>
 const JOBS=[["営","営業職"],["事","事務職"],["エ","エンジニア"],
   ["販","販売・接客"],["製","製造・工場"],["介","介護・福祉"],
   ["ド","ドライバー"],["軽","軽作業"],["医","医療・看護"],["デ","デザイナー"]];
-const SITES=["Indeed","エンゲージ","マイナビ転職","エン転職","マイナビ"];
+const SITES=["Indeed","マイナビ転職","エン転職","エンゲージ","マイナビ"];
 const RC=["n1","n2","n3","n4","n5"];
 let es=null;
 
