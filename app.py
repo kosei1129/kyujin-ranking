@@ -1,17 +1,23 @@
 """
-求人給与ランキング Webアプリ
-起動: python3 app.py
-ブラウザ: http://localhost:8080
+求人給与ランキング（ローカル専用・高精度版）
+起動: python3 app.py  →  http://localhost:8080
+
+・Indeed: ヘッド付きブラウザ＋永続プロファイルで初回ログイン保存、以降自動ログイン
+・全サイト最大10ページ取得
+・雇用形態（派遣/バイト/パートetc）・勤務日数（週3/単発etc）を表示
+・TOP10ランキング
 """
 
 import asyncio
 import json
+import os
 import queue
 import re
 import threading
 import urllib.parse
-import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from functools import partial
 
 import requests
 from bs4 import BeautifulSoup
@@ -26,7 +32,10 @@ except ImportError:
 
 app = Flask(__name__)
 
-MAX_PAGES = 10   # 各サイト最大何ページ取得するか
+MAX_PAGES      = 10    # 各サイト最大ページ数
+TOP_N          = 10    # ランキング表示件数
+LOGIN_WAIT     = 30    # Indeedログイン待機秒数
+INDEED_PROFILE = os.path.expanduser("~/.kyujin_indeed_profile")
 
 SHOKUSHU_LIST = [
     "営業職", "事務職", "エンジニア", "販売・接客",
@@ -35,7 +44,7 @@ SHOKUSHU_LIST = [
 ]
 
 # ─────────────────────────────────────────
-# HTTP セッション（requests用）
+# HTTP セッション
 # ─────────────────────────────────────────
 
 _http = requests.Session()
@@ -45,30 +54,63 @@ _http.headers.update({
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
 })
 
 
 # ─────────────────────────────────────────
-# 給与パース
+# 給与パース（範囲対応・max値使用）
 # ─────────────────────────────────────────
 
 def parse_salary(text: str) -> dict:
-    result = {"raw": text, "jikyu": None, "monthly": None, "annual": None, "jikyu_normalized": None}
+    result = {
+        "raw": text, "jikyu": None, "jikyu_min": None,
+        "monthly": None, "annual": None, "jikyu_normalized": None,
+    }
     if not text:
         return result
     t = text.replace(",", "").replace("，", "").replace(" ", "").replace("　", "")
 
-    m = re.search(r"時給[^\d]*(\d+)", t)
+    # 時給（範囲 例: 時給1900〜2500円）→ max使用
+    m = re.search(r"時給[^\d]*(\d{3,6})(?:円)?[〜~\-－～]+(\d{3,6})", t)
     if m:
-        result["jikyu"] = int(m.group(1))
-        result["jikyu_normalized"] = int(m.group(1))
+        mn, mx = int(m.group(1)), int(m.group(2))
+        result["jikyu"] = mx
+        result["jikyu_min"] = mn
+        result["jikyu_normalized"] = mx
         return result
 
+    # 時給（単一）
+    m = re.search(r"時給[^\d]*(\d{3,6})", t)
+    if m:
+        v = int(m.group(1))
+        result["jikyu"] = v
+        result["jikyu_normalized"] = v
+        return result
+
+    # 日給（8時間換算）
+    m = re.search(r"日給[^\d]*(\d+(?:\.\d+)?)(万)?", t)
+    if m:
+        val = float(m.group(1))
+        if m.group(2) == "万":
+            val *= 10000
+        result["jikyu_normalized"] = int(val / 8)
+        return result
+
+    # 月給（範囲 → max）
+    m = re.search(r"月[給収][^\d]*(\d+(?:\.\d+)?)(万)?[〜~\-－～]+(\d+(?:\.\d+)?)(万)?", t)
+    if m:
+        val = float(m.group(3))
+        if m.group(4) == "万":
+            val *= 10000
+        result["monthly"] = int(val)
+        result["jikyu_normalized"] = int(val / 160)
+        return result
+
+    # 月給（単一）
     m = re.search(r"月[給収][^\d]*(\d+(?:\.\d+)?)(万)?", t)
     if m:
         val = float(m.group(1))
@@ -78,6 +120,17 @@ def parse_salary(text: str) -> dict:
         result["jikyu_normalized"] = int(val / 160)
         return result
 
+    # 年収（範囲 → max）
+    m = re.search(r"年[収給][^\d]*(\d+(?:\.\d+)?)(万)?[〜~\-－～]+(\d+(?:\.\d+)?)(万)?", t)
+    if m:
+        val = float(m.group(3))
+        if m.group(4) == "万":
+            val *= 10000
+        result["annual"] = int(val)
+        result["jikyu_normalized"] = int(val / (12 * 160))
+        return result
+
+    # 年収（単一）
     m = re.search(r"年[収給][^\d]*(\d+(?:\.\d+)?)(万)?", t)
     if m:
         val = float(m.group(1))
@@ -87,6 +140,7 @@ def parse_salary(text: str) -> dict:
         result["jikyu_normalized"] = int(val / (12 * 160))
         return result
 
+    # NN万円（月給扱い）
     m = re.search(r"(\d+(?:\.\d+)?)万円?", t)
     if m:
         val = float(m.group(1)) * 10000
@@ -97,6 +151,8 @@ def parse_salary(text: str) -> dict:
 
 def salary_display(parsed: dict) -> str:
     if parsed.get("jikyu"):
+        if parsed.get("jikyu_min") and parsed["jikyu_min"] != parsed["jikyu"]:
+            return f"時給 {parsed['jikyu_min']:,}〜{parsed['jikyu']:,}円"
         return f"時給 {parsed['jikyu']:,}円"
     if parsed.get("monthly"):
         return f"月給 {parsed['monthly']:,}円"
@@ -106,7 +162,59 @@ def salary_display(parsed: dict) -> str:
 
 
 # ─────────────────────────────────────────
-# テキストから給与付き求人を抽出（汎用）
+# 雇用形態・勤務体制パース
+# ─────────────────────────────────────────
+
+def extract_employment_type(text: str) -> str:
+    for pattern, label in [
+        (r"派遣社員|派遣スタッフ|人材派遣|派遣", "派遣"),
+        (r"アルバイト|バイト", "アルバイト"),
+        (r"パートタイム|パート", "パート"),
+        (r"正社員", "正社員"),
+        (r"契約社員", "契約社員"),
+        (r"業務委託|フリーランス", "業務委託"),
+    ]:
+        if re.search(pattern, text):
+            return label
+    return ""
+
+
+def extract_work_schedule(text: str) -> str:
+    # 週N〜M日
+    m = re.search(r"週\s*([1-7])\s*[〜~～]\s*([1-7])\s*日", text)
+    if m:
+        return f"週{m.group(1)}〜{m.group(2)}日"
+    # 週N日
+    m = re.search(r"週\s*([1-7])\s*日", text)
+    if m:
+        return f"週{m.group(1)}日"
+    # 週N回
+    m = re.search(r"週\s*([1-7])\s*回", text)
+    if m:
+        return f"週{m.group(1)}回"
+    # 週N日以上
+    m = re.search(r"週\s*([1-7])\s*日以上", text)
+    if m:
+        return f"週{m.group(1)}日〜"
+    if re.search(r"単発", text):
+        return "単発"
+    if re.search(r"短期", text):
+        return "短期"
+    if re.search(r"フルタイム", text):
+        return "フルタイム"
+    if re.search(r"土日(?:祝)?のみ|週末のみ", text):
+        return "土日のみ"
+    if re.search(r"平日のみ", text):
+        return "平日のみ"
+    if re.search(r"シフト自由", text):
+        return "シフト自由"
+    if re.search(r"シフト制", text):
+        return "シフト制"
+    return ""
+
+
+# ─────────────────────────────────────────
+# テキスト汎用抽出（フォールバック）
 # ─────────────────────────────────────────
 
 NOISE = re.compile(
@@ -115,34 +223,39 @@ NOISE = re.compile(
     r"トップ|ホーム|ナビ|メニュー|詳細|確認|\d+件|\d+ページ)$"
 )
 
-def extract_jobs_from_text(text: str, site_name: str, max_jobs: int = 9999) -> list:
+def extract_jobs_from_text(text: str, site_name: str) -> list:
     jobs = []
     lines = [l.strip() for l in text.split("\n") if l.strip()]
+    seen: set = set()
     for i, line in enumerate(lines):
-        if not re.search(r"(時給|月給|年収)[^\d]*\d", line):
+        if not re.search(r"(時給|月給|日給|年収)[^\d]*\d", line):
             continue
         title, company = "", ""
-        for j in range(i - 1, max(0, i - 14), -1):
+        for j in range(i - 1, max(0, i - 16), -1):
             ln = lines[j]
-            if len(ln) < 5 or NOISE.match(ln):
+            if len(ln) < 4 or NOISE.match(ln):
                 continue
-            if re.search(r"\d+万|\d+円|〜|以上|応相談|※|【|】", ln):
+            if re.search(r"\d+万|\d+円|〜|以上|応相談|※|【|】|\d+件", ln):
                 continue
             if not title:
                 title = ln[:80]
             elif not company:
                 company = ln[:50]
                 break
-        if title:
-            jobs.append({"site": site_name, "title": title,
-                         "company": company, "location": "", "salary_text": line})
-        if len(jobs) >= max_jobs:
-            break
+        if title and title not in seen:
+            seen.add(title)
+            ctx = " ".join(lines[max(0, i - 8):i + 4])
+            jobs.append({
+                "site": site_name, "title": title, "company": company,
+                "location": "", "salary_text": line,
+                "employment_type": extract_employment_type(ctx),
+                "work_schedule": extract_work_schedule(ctx),
+            })
     return jobs
 
 
 # ─────────────────────────────────────────
-# HTTP スクレイパー（requests + BeautifulSoup）
+# HTTP フェッチ
 # ─────────────────────────────────────────
 
 def _fetch(url: str, referer: str = "https://www.google.co.jp/") -> BeautifulSoup | None:
@@ -153,95 +266,9 @@ def _fetch(url: str, referer: str = "https://www.google.co.jp/") -> BeautifulSou
         return None
 
 
-def _parse_indeed_rss(text: str) -> list:
-    jobs = []
-    if "<rss" not in text and "<feed" not in text:
-        return jobs
-    try:
-        root = ET.fromstring(text.encode())
-        for item in root.findall(".//item")[:25]:
-            title_raw = item.findtext("title", "")
-            desc_html = item.findtext("description", "")
-            desc_text = (BeautifulSoup(desc_html, "html.parser").get_text("\n", strip=True)
-                         if desc_html else "")
-            title, company = title_raw, ""
-            if " - " in title_raw:
-                parts = title_raw.rsplit(" - ", 1)
-                title = parts[0].strip()
-                company = re.sub(r"\s*\([^)]+\)\s*$", "", parts[1]).strip()
-            salary = ""
-            m = re.search(r"(時給|月給|年収)[^\d]*\d[\d,万円]+", desc_text)
-            if m:
-                salary = m.group(0)
-            if title:
-                jobs.append({"site": "Indeed", "title": title,
-                             "company": company, "location": "", "salary_text": salary})
-    except Exception:
-        pass
-    return jobs
-
-
-def _parse_indeed_html(html: str) -> list:
-    jobs = []
-    soup = BeautifulSoup(html, "html.parser")
-    for card in soup.select("div.job_seen_beacon, div[data-jk]")[:20]:
-        te = card.select_one("h2.jobTitle span, h2 a span")
-        ce = card.select_one("[data-testid='company-name'], .companyName")
-        se = card.select_one("[data-testid='attribute_snippet_testid'], [class*='salary']")
-        title = te.get_text(strip=True) if te else ""
-        if title:
-            jobs.append({"site": "Indeed", "title": title,
-                         "company": ce.get_text(strip=True) if ce else "",
-                         "location": "",
-                         "salary_text": se.get_text(strip=True) if se else ""})
-    if not jobs:
-        jobs = extract_jobs_from_text(soup.get_text("\n", strip=True), "Indeed")
-    return jobs
-
-
-def http_scrape_indeed(keyword: str) -> list:
-    rss_url  = f"https://jp.indeed.com/rss?q={urllib.parse.quote(keyword)}&sort=date&limit=25"
-    html_url = f"https://jp.indeed.com/jobs?q={urllib.parse.quote(keyword)}&sort=date&limit=20"
-    rss_headers = {"Accept": "application/rss+xml,application/xml,text/xml",
-                   "Accept-Language": "ja-JP,ja;q=0.9"}
-
-    # ── curl_cffi でCloudflare TLSフィンガープリントを回避 ──
-    if HAS_CFFI:
-        for impersonate in ("chrome110", "chrome107"):
-            try:
-                resp = cffi_req.get(rss_url, impersonate=impersonate,
-                                    timeout=20, headers=rss_headers)
-                if resp.status_code == 200:
-                    jobs = _parse_indeed_rss(resp.text)
-                    if jobs:
-                        return jobs
-            except Exception:
-                pass
-        try:
-            resp = cffi_req.get(html_url, impersonate="chrome110", timeout=20,
-                                headers={"Accept-Language": "ja-JP,ja;q=0.9"})
-            if resp.status_code == 200:
-                jobs = _parse_indeed_html(resp.text)
-                if jobs:
-                    return jobs
-        except Exception:
-            pass
-
-    # ── 通常 requests フォールバック ──
-    try:
-        resp = _http.get(rss_url, timeout=20,
-                         headers={**rss_headers, "Referer": "https://jp.indeed.com/"})
-        if resp.status_code == 200:
-            jobs = _parse_indeed_rss(resp.text)
-            if jobs:
-                return jobs
-    except Exception:
-        pass
-
-    soup = _fetch(html_url)
-    return _parse_indeed_html(soup.prettify() if soup else "") if soup else []
-
-
+# ─────────────────────────────────────────
+# マイナビ転職（HTTP・並列ページ取得）
+# ─────────────────────────────────────────
 
 def _extract_mynavi_t(soup: BeautifulSoup) -> list:
     jobs = []
@@ -263,15 +290,20 @@ def _extract_mynavi_t(soup: BeautifulSoup) -> list:
                 title = h.get_text(strip=True)
         card_text = card.get_text("\n", strip=True)
         salary = ""
-        for ptn in [r"給与\s*\t([^\n]+)", r"給与\s*\n\s*([^\n]+)",
-                    r"月給[^\d]*(\d[\d,万円〜\-～以上]+)", r"年収[^\d]*(\d[\d,万円〜\-～以上]+)"]:
+        for ptn in [r"給与\s*[\t\n]\s*([^\n]+)",
+                    r"月給[^\d]*(\d[\d,万円〜\-～以上]+)",
+                    r"年収[^\d]*(\d[\d,万円〜\-～以上]+)"]:
             m = re.search(ptn, card_text)
             if m:
                 salary = m.group(1).strip()
                 break
         if title:
-            jobs.append({"site": "マイナビ転職", "title": title,
-                         "company": company, "location": "", "salary_text": salary})
+            jobs.append({
+                "site": "マイナビ転職", "title": title, "company": company,
+                "location": "", "salary_text": salary,
+                "employment_type": extract_employment_type(card_text),
+                "work_schedule": extract_work_schedule(card_text),
+            })
     return jobs
 
 
@@ -289,12 +321,8 @@ def _fetch_mynavi_t_page(keyword: str, page: int) -> list:
 
 
 def http_scrape_mynavi_tenshoku(keyword: str) -> list:
-    # 全ページを同時フェッチ
-    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=MAX_PAGES) as ex:
-        futures = [ex.submit(_fetch_mynavi_t_page, keyword, pg)
-                   for pg in range(1, MAX_PAGES + 1)]
-        pages = [f.result() for f in futures]
+        pages = list(ex.map(partial(_fetch_mynavi_t_page, keyword), range(1, MAX_PAGES + 1)))
     seen, all_jobs = set(), []
     for jobs in pages:
         for j in jobs:
@@ -304,11 +332,13 @@ def http_scrape_mynavi_tenshoku(keyword: str) -> list:
     return all_jobs
 
 
+# ─────────────────────────────────────────
+# エン転職（HTTP・並列ページ取得）
+# ─────────────────────────────────────────
+
 def _extract_en_tenshoku(soup: BeautifulSoup) -> list:
     jobs = []
-    cards = soup.select(".jobSearchListUnit, [class*='jobSearchList'], [class*='job-unit']")
-    if not cards:
-        cards = soup.select("article, li[class*='item']")
+    cards = soup.select(".jobSearchListUnit, [class*='jobSearchList'], [class*='job-unit'], article, li[class*='item']")
     for card in cards:
         te = card.select_one(".jobNameText, [class*='jobName'], h2 a, h3 a")
         ce = card.select_one(".company, [class*='companyName'], [class*='company']")
@@ -316,16 +346,21 @@ def _extract_en_tenshoku(soup: BeautifulSoup) -> list:
         company = ce.get_text(strip=True) if ce else ""
         card_text = card.get_text("\n", strip=True)
         salary = ""
-        for ptn in [r"給与\s*\n\s*([^\n]+)", r"給与\s*([月年時][^\n]+)",
-                    r"月給[^\d]*(\d[\d,万円〜\-～以上]+)", r"年収[^\d]*(\d[\d,万円〜\-～以上]+)",
-                    r"時給[^\d]*(\d[\d,]+)"]:
+        for ptn in [r"給与\s*\n\s*([^\n]+)",
+                    r"月給[^\d]*(\d[\d,万円〜\-～以上]+)",
+                    r"年収[^\d]*(\d[\d,万円〜\-～以上]+)",
+                    r"時給[^\d]*(\d[\d,]+(?:[〜~]\d[\d,]+)?)"]:
             m = re.search(ptn, card_text)
             if m:
                 salary = m.group(1).strip()
                 break
         if title:
-            jobs.append({"site": "エン転職", "title": title,
-                         "company": company, "location": "", "salary_text": salary})
+            jobs.append({
+                "site": "エン転職", "title": title, "company": company,
+                "location": "", "salary_text": salary,
+                "employment_type": extract_employment_type(card_text),
+                "work_schedule": extract_work_schedule(card_text),
+            })
     return jobs
 
 
@@ -343,12 +378,8 @@ def _fetch_en_tenshoku_page(keyword: str, page: int) -> list:
 
 
 def http_scrape_en_tenshoku(keyword: str) -> list:
-    # 全ページを同時フェッチ
-    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=MAX_PAGES) as ex:
-        futures = [ex.submit(_fetch_en_tenshoku_page, keyword, pg)
-                   for pg in range(1, MAX_PAGES + 1)]
-        pages = [f.result() for f in futures]
+        pages = list(ex.map(partial(_fetch_en_tenshoku_page, keyword), range(1, MAX_PAGES + 1)))
     seen, all_jobs = set(), []
     for jobs in pages:
         for j in jobs:
@@ -359,42 +390,228 @@ def http_scrape_en_tenshoku(keyword: str) -> list:
 
 
 # ─────────────────────────────────────────
-# Playwright スクレイパー（SPA サイト）
+# バイトル（HTTP・並列ページ取得）
 # ─────────────────────────────────────────
 
-async def playwright_scrape_indeed(page, keyword: str) -> list:
-    """Indeed：Playwright で最後の試み（データセンターIPでブロックされる場合は0件）"""
+def _extract_baitoru(soup: BeautifulSoup) -> list:
     jobs = []
-    try:
-        url = f"https://jp.indeed.com/jobs?q={urllib.parse.quote(keyword)}&sort=date&limit=20"
-        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(5000)
-        body = await page.inner_text("body")
-        title_text = await page.title()
-        if any(w in title_text + body for w in ["Security Check", "セキュリティ", "Captcha", "robot"]):
-            return jobs
-        for card in (await page.query_selector_all("div.job_seen_beacon, div[data-jk]"))[:20]:
-            try:
-                te = await card.query_selector("h2.jobTitle span, h2 a span")
-                ce = await card.query_selector("[data-testid='company-name'], .companyName")
-                se = await card.query_selector("[data-testid='attribute_snippet_testid'], [class*='salary']")
-                title = (await te.inner_text()).strip() if te else ""
-                if title:
-                    jobs.append({"site": "Indeed", "title": title,
-                                 "company": (await ce.inner_text()).strip() if ce else "",
-                                 "location": "",
-                                 "salary_text": (await se.inner_text()).strip() if se else ""})
-            except Exception:
-                continue
-        if not jobs:
-            jobs = extract_jobs_from_text(body, "Indeed")
-    except Exception:
-        pass
+    cards = soup.select(
+        ".cassette, .cassetteJobs, .jobList__item, "
+        "[class*='jobList'], [class*='job-list'], "
+        "[class*='job-unit'], [class*='jobUnit']"
+    )
+    if not cards:
+        return extract_jobs_from_text(soup.get_text("\n", strip=True), "バイトル")
+    for card in cards:
+        te = card.select_one(
+            ".jobName, .cassetteJobs__name, [class*='jobName'], "
+            "[class*='jobTitle'], [class*='title'], h2, h3"
+        )
+        ce = card.select_one(
+            ".shopName, .storeName, [class*='shopName'], [class*='storeName'], "
+            "[class*='company'], [class*='Company']"
+        )
+        title = te.get_text(strip=True) if te else ""
+        company = ce.get_text(strip=True) if ce else ""
+        card_text = card.get_text("\n", strip=True)
+        salary = ""
+        m = re.search(r"(時給|日給|月給)[^\d]*(\d[\d,]+(?:[〜~\-]\d[\d,]+)?)", card_text)
+        if m:
+            salary = m.group(0)
+        if title:
+            jobs.append({
+                "site": "バイトル", "title": title, "company": company,
+                "location": "", "salary_text": salary,
+                "employment_type": extract_employment_type(card_text),
+                "work_schedule": extract_work_schedule(card_text),
+            })
     return jobs
 
 
+def _fetch_baitoru_page(keyword: str, page: int) -> list:
+    base = f"https://www.baitoru.com/op/list/?keyword={urllib.parse.quote(keyword, safe='')}"
+    url = base if page == 1 else f"{base}&pageNo={page}"
+    soup = _fetch(url, referer="https://www.baitoru.com/")
+    if not soup:
+        return []
+    jobs = _extract_baitoru(soup)
+    if not jobs and page == 1:
+        jobs = extract_jobs_from_text(soup.get_text("\n", strip=True), "バイトル")
+    return jobs
+
+
+def http_scrape_baitoru(keyword: str) -> list:
+    with ThreadPoolExecutor(max_workers=MAX_PAGES) as ex:
+        pages = list(ex.map(partial(_fetch_baitoru_page, keyword), range(1, MAX_PAGES + 1)))
+    seen, all_jobs = set(), []
+    for jobs in pages:
+        for j in jobs:
+            if j["title"] not in seen:
+                seen.add(j["title"])
+                all_jobs.append(j)
+    return all_jobs
+
+
+# ─────────────────────────────────────────
+# Playwright: Indeed（ヘッド付き＋永続プロファイル）
+# ─────────────────────────────────────────
+
+async def playwright_scrape_indeed(keyword: str, q: queue.Queue) -> list:
+    """
+    永続プロファイル（~/.kyujin_indeed_profile）でログイン状態を保存。
+    初回のみログインが必要（ブラウザが開くので手動でログイン）。
+    以降は自動ログイン済み。
+    """
+    all_jobs = []
+    seen: set = set()
+    q_enc = urllib.parse.quote(keyword)
+
+    try:
+        async with async_playwright() as p:
+            os.makedirs(INDEED_PROFILE, exist_ok=True)
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=INDEED_PROFILE,
+                headless=False,   # ← ヘッド付き（ログイン可能、ブロック回避）
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1280,800",
+                    "--start-maximized",
+                ],
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="ja-JP",
+                ignore_https_errors=True,
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};"
+                "Object.defineProperty(navigator,'languages',{get:()=>['ja-JP','ja','en-US']});"
+            )
+
+            page = await context.new_page()
+
+            # Indeedホームへ移動してログイン状態を確認
+            try:
+                await page.goto("https://jp.indeed.com/", timeout=20000,
+                                wait_until="domcontentloaded")
+                await page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            # ログイン状態チェック
+            is_logged_in = bool(await page.query_selector(
+                '[data-testid="UserProfileMenuButton"], .gnav-UserInfo__email, '
+                '[class*="AccountMenuButton"], [class*="userAccount"], [aria-label*="アカウント"]'
+            ))
+
+            if not is_logged_in:
+                q.put({"type": "progress", "site": "Indeed",
+                       "status": "login_wait",
+                       "msg": "ブラウザが開きました。Indeedにログインしてください。"})
+                for sec in range(LOGIN_WAIT, 0, -1):
+                    q.put({"type": "progress", "site": "Indeed",
+                           "status": "countdown", "seconds": sec})
+                    await asyncio.sleep(1)
+                    try:
+                        is_logged_in = bool(await page.query_selector(
+                            '[data-testid="UserProfileMenuButton"], .gnav-UserInfo__email, '
+                            '[class*="AccountMenuButton"]'
+                        ))
+                        if is_logged_in:
+                            break
+                    except Exception:
+                        pass
+
+            q.put({"type": "progress", "site": "Indeed", "status": "scraping"})
+
+            # 全ページスクレイピング
+            for pg in range(1, MAX_PAGES + 1):
+                url = (f"https://jp.indeed.com/jobs?q={q_enc}&sort=date&limit=20"
+                       if pg == 1 else
+                       f"https://jp.indeed.com/jobs?q={q_enc}&sort=date&limit=20&start={20*(pg-1)}")
+                try:
+                    await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(3000)
+                except Exception:
+                    break
+
+                title_text = await page.title()
+                body_text = await page.inner_text("body")
+                if any(w in title_text + body_text
+                       for w in ["Security Check", "CAPTCHA", "robot", "403 Forbidden"]):
+                    break
+
+                cards = await page.query_selector_all("div.job_seen_beacon, div[data-jk]")
+                page_jobs = []
+
+                for card in cards:
+                    try:
+                        te = await card.query_selector(
+                            "h2 a span[title], h2.jobTitle span, h2 a span")
+                        ce = await card.query_selector(
+                            "[data-testid='company-name'], .companyName")
+                        se = await card.query_selector(
+                            "[data-testid='attribute_snippet_testid'], "
+                            "[class*='salary-snippet'], [class*='salaryText']")
+                        title = (await te.inner_text()).strip() if te else ""
+                        if not title:
+                            continue
+                        card_text = (await card.inner_text()).strip()
+                        salary = (await se.inner_text()).strip() if se else ""
+                        if not salary:
+                            m2 = re.search(
+                                r"(時給|月給|日給|年収)[^\d]*\d[\d,万円〜\-～]+", card_text)
+                            if m2:
+                                salary = m2.group(0)
+                        if title not in seen:
+                            seen.add(title)
+                            page_jobs.append({
+                                "site": "Indeed",
+                                "title": title,
+                                "company": (await ce.inner_text()).strip() if ce else "",
+                                "location": "",
+                                "salary_text": salary,
+                                "employment_type": extract_employment_type(card_text),
+                                "work_schedule": extract_work_schedule(card_text),
+                            })
+                    except Exception:
+                        continue
+
+                if not page_jobs and pg == 1:
+                    fallback = extract_jobs_from_text(body_text, "Indeed")
+                    for j in fallback:
+                        if j["title"] not in seen:
+                            seen.add(j["title"])
+                            all_jobs.append(j)
+                    break
+
+                all_jobs.extend(page_jobs)
+                if not page_jobs:
+                    break
+
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+    except Exception as e:
+        q.put({"type": "progress", "site": "Indeed",
+               "status": "error", "msg": f"ブラウザエラー: {e}"})
+
+    return all_jobs
+
+
+# ─────────────────────────────────────────
+# Playwright: エンゲージ（全ページ）
+# ─────────────────────────────────────────
+
 async def playwright_scrape_engage(page, keyword: str) -> list:
-    """エンゲージ：React SPA なので Playwright + networkidle で完全読み込みを待つ（全ページ取得）"""
     all_jobs = []
     seen: set = set()
     try:
@@ -420,13 +637,17 @@ async def playwright_scrape_engage(page, keyword: str) -> list:
                     title = (await te.inner_text()).strip() if te else ""
                     card_text = (await card.inner_text()).strip()
                     salary = ""
-                    m = re.search(r"(時給|月給|年収)[^\d]*\d[\d,万円〜]+", card_text)
+                    m = re.search(r"(時給|月給|日給|年収)[^\d]*\d[\d,万円〜\-～]+", card_text)
                     if m:
                         salary = m.group(0)
                     if title and title not in seen:
                         seen.add(title)
-                        page_jobs.append({"site": "エンゲージ", "title": title,
-                                          "company": "", "location": "", "salary_text": salary})
+                        page_jobs.append({
+                            "site": "エンゲージ", "title": title,
+                            "company": "", "location": "", "salary_text": salary,
+                            "employment_type": extract_employment_type(card_text),
+                            "work_schedule": extract_work_schedule(card_text),
+                        })
                 except Exception:
                     continue
 
@@ -441,11 +662,15 @@ async def playwright_scrape_engage(page, keyword: str) -> list:
 
             all_jobs.extend(page_jobs)
             if not page_jobs:
-                break  # これ以上ページなし
+                break
     except Exception:
         pass
     return all_jobs
 
+
+# ─────────────────────────────────────────
+# Playwright: マイナビバイト（全ページ）
+# ─────────────────────────────────────────
 
 async def playwright_scrape_mynavi_baito(page, keyword: str) -> list:
     all_jobs = []
@@ -468,15 +693,24 @@ async def playwright_scrape_mynavi_baito(page, keyword: str) -> list:
                         continue
                     company = re.sub(r"/\d+$", "", lines[0]).strip()
                     title = lines[1]
+                    card_text = "\n".join(lines)
                     salary_text = ""
                     for i, line in enumerate(lines):
                         if line == "給与" and i + 1 < len(lines):
                             salary_text = lines[i + 1]
                             break
+                    if not salary_text:
+                        m = re.search(r"(時給|月給)[^\d]*\d[\d,]+", card_text)
+                        if m:
+                            salary_text = m.group(0)
                     if title and title not in seen:
                         seen.add(title)
-                        page_jobs.append({"site": "マイナビ", "title": title,
-                                          "company": company, "location": "", "salary_text": salary_text})
+                        page_jobs.append({
+                            "site": "マイナビ", "title": title, "company": company,
+                            "location": "", "salary_text": salary_text,
+                            "employment_type": extract_employment_type(card_text),
+                            "work_schedule": extract_work_schedule(card_text),
+                        })
                 except Exception:
                     continue
 
@@ -498,32 +732,47 @@ async def playwright_scrape_mynavi_baito(page, keyword: str) -> list:
 
 
 # ─────────────────────────────────────────
-# メインスクレイピング
+# HTTPスクレイパー並列ラッパー
+# ─────────────────────────────────────────
+
+async def _run_http(site_name: str, fn, keyword: str, q: queue.Queue) -> list:
+    q.put({"type": "progress", "site": site_name, "status": "searching"})
+    try:
+        jobs = await asyncio.to_thread(fn, keyword)
+        sc = sum(1 for j in jobs if j.get("salary_text"))
+        q.put({"type": "progress", "site": site_name,
+               "status": "done", "count": len(jobs), "salary_count": sc})
+        return jobs
+    except Exception as e:
+        q.put({"type": "progress", "site": site_name, "status": "error", "msg": str(e)})
+        return []
+
+
+# ─────────────────────────────────────────
+# メインスクレイパー
 # ─────────────────────────────────────────
 
 async def run_scraper(keyword: str, q: queue.Queue):
     all_jobs = []
 
-    # ── HTTP スクレイパー（requests / curl_cffi）──
-    http_scrapers = [
-        ("Indeed",      http_scrape_indeed),   # curl_cffi で Cloudflare 回避を試みる
-        ("マイナビ転職", http_scrape_mynavi_tenshoku),
-        ("エン転職",     http_scrape_en_tenshoku),
-    ]
+    # ── Phase 1: HTTP スクレイパー（並列） ──
+    results = await asyncio.gather(
+        _run_http("マイナビ転職", http_scrape_mynavi_tenshoku, keyword, q),
+        _run_http("エン転職",     http_scrape_en_tenshoku,     keyword, q),
+        _run_http("バイトル",     http_scrape_baitoru,         keyword, q),
+    )
+    for jobs in results:
+        all_jobs.extend(jobs)
 
-    for site_name, fn in http_scrapers:
-        q.put({"type": "progress", "site": site_name, "status": "searching"})
-        try:
-            jobs = await asyncio.to_thread(fn, keyword)
-            all_jobs.extend(jobs)
-            salary_count = sum(1 for j in jobs if j["salary_text"])
-            q.put({"type": "progress", "site": site_name,
-                   "status": "done", "count": len(jobs), "salary_count": salary_count})
-        except Exception as e:
-            q.put({"type": "progress", "site": site_name, "status": "error", "msg": str(e)})
-        await asyncio.sleep(0.5)
+    # ── Phase 2: Indeed（ヘッド付きPlaywright・永続プロファイル） ──
+    q.put({"type": "progress", "site": "Indeed", "status": "searching"})
+    indeed_jobs = await playwright_scrape_indeed(keyword, q)
+    all_jobs.extend(indeed_jobs)
+    sc = sum(1 for j in indeed_jobs if j.get("salary_text"))
+    q.put({"type": "progress", "site": "Indeed",
+           "status": "done", "count": len(indeed_jobs), "salary_count": sc})
 
-    # ── Playwright スクレイパー（マイナビバイト + エンゲージ）──
+    # ── Phase 3: エンゲージ＋マイナビバイト（ヘッドレスPlaywright） ──
     q.put({"type": "progress", "site": "マイナビ", "status": "searching"})
     q.put({"type": "progress", "site": "エンゲージ", "status": "searching"})
 
@@ -555,11 +804,12 @@ async def run_scraper(keyword: str, q: queue.Queue):
         try:
             jobs = await playwright_scrape_mynavi_baito(page1, keyword)
             all_jobs.extend(jobs)
-            salary_count = sum(1 for j in jobs if j["salary_text"])
+            sc = sum(1 for j in jobs if j.get("salary_text"))
             q.put({"type": "progress", "site": "マイナビ",
-                   "status": "done", "count": len(jobs), "salary_count": salary_count})
+                   "status": "done", "count": len(jobs), "salary_count": sc})
         except Exception as e:
-            q.put({"type": "progress", "site": "マイナビ", "status": "error", "msg": str(e)})
+            q.put({"type": "progress", "site": "マイナビ",
+                   "status": "error", "msg": str(e)})
         finally:
             await page1.close()
 
@@ -568,58 +818,55 @@ async def run_scraper(keyword: str, q: queue.Queue):
         try:
             jobs = await playwright_scrape_engage(page2, keyword)
             all_jobs.extend(jobs)
-            salary_count = sum(1 for j in jobs if j["salary_text"])
+            sc = sum(1 for j in jobs if j.get("salary_text"))
             q.put({"type": "progress", "site": "エンゲージ",
-                   "status": "done", "count": len(jobs), "salary_count": salary_count})
+                   "status": "done", "count": len(jobs), "salary_count": sc})
         except Exception as e:
-            q.put({"type": "progress", "site": "エンゲージ", "status": "error", "msg": str(e)})
+            q.put({"type": "progress", "site": "エンゲージ",
+                   "status": "error", "msg": str(e)})
         finally:
             await page2.close()
 
-        # Indeed（HTTPで0件だった場合、Playwright でも試みる）
-        indeed_http_count = sum(1 for j in all_jobs if j["site"] == "Indeed")
-        if indeed_http_count == 0:
-            page3 = await context.new_page()
-            try:
-                jobs = await playwright_scrape_indeed(page3, keyword)
-                if jobs:
-                    # HTTP 側で既に progress を送っているので件数を上書き通知
-                    all_jobs.extend(jobs)
-                    salary_count = sum(1 for j in jobs if j["salary_text"])
-                    q.put({"type": "progress", "site": "Indeed",
-                           "status": "done", "count": len(jobs), "salary_count": salary_count})
-            except Exception:
-                pass
-            finally:
-                await page3.close()
-
         await browser.close()
 
-    # ランキング計算
+    # ── ランキング計算 ──
     parsed_jobs = []
+    seen_titles: set = set()
     for job in all_jobs:
-        parsed = parse_salary(job["salary_text"])
+        # サイト間の重複除去
+        key = f"{job['title']}_{job.get('company','')}"
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        parsed = parse_salary(job.get("salary_text", ""))
         if parsed["jikyu_normalized"]:
             parsed_jobs.append({**job, **parsed})
 
     jikyu_ranking = sorted(
         [j for j in parsed_jobs if j.get("jikyu")],
         key=lambda x: x["jikyu"], reverse=True,
-    )[:5]
+    )[:TOP_N]
 
     salary_ranking = sorted(
         parsed_jobs, key=lambda x: x["jikyu_normalized"], reverse=True,
-    )[:5]
+    )[:TOP_N]
 
     def fmt(jobs):
-        return [{"site": j["site"], "title": j["title"], "company": j["company"],
-                 "salary": salary_display(j), "raw": j["salary_text"]} for j in jobs]
+        return [{
+            "site":    j["site"],
+            "title":   j["title"],
+            "company": j["company"],
+            "salary":  salary_display(j),
+            "raw":     j.get("salary_text", ""),
+            "emp":     j.get("employment_type", ""),
+            "sched":   j.get("work_schedule", ""),
+        } for j in jobs]
 
     q.put({
         "type": "result",
         "total": len(all_jobs),
         "timestamp": datetime.now().strftime("%Y年%m月%d日 %H:%M"),
-        "jikyu_ranking": fmt(jikyu_ranking),
+        "jikyu_ranking":  fmt(jikyu_ranking),
         "salary_ranking": fmt(salary_ranking),
     })
     q.put(None)
@@ -666,7 +913,7 @@ def search():
 
 
 # ─────────────────────────────────────────
-# HTML テンプレート（ライトビジネス）
+# HTML テンプレート
 # ─────────────────────────────────────────
 
 HTML = """<!DOCTYPE html>
@@ -677,28 +924,15 @@ HTML = """<!DOCTYPE html>
 <title>求人給与ランキング</title>
 <style>
   :root {
-    --bg: #f0f4f8;
-    --surface: #ffffff;
-    --header: #1a3654;
-    --primary: #1d4ed8;
-    --primary-light: #eff6ff;
-    --primary-border: #bfdbfe;
-    --success: #15803d;
-    --success-light: #f0fdf4;
-    --success-border: #86efac;
-    --warning: #b45309;
-    --warning-light: #fffbeb;
-    --warning-border: #fcd34d;
-    --error: #dc2626;
-    --error-light: #fef2f2;
-    --error-border: #fca5a5;
-    --text: #111827;
-    --text-sub: #374151;
-    --text-muted: #6b7280;
-    --border: #e5e7eb;
-    --border-mid: #d1d5db;
-    --shadow-sm: 0 1px 2px rgba(0,0,0,.05);
-    --shadow: 0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.06);
+    --bg:#f0f4f8;--surface:#fff;--header:#1a3654;
+    --primary:#1d4ed8;--primary-light:#eff6ff;--primary-border:#bfdbfe;
+    --success:#15803d;--success-light:#f0fdf4;--success-border:#86efac;
+    --warning:#b45309;--warning-light:#fffbeb;--warning-border:#fcd34d;
+    --error:#dc2626;--error-light:#fef2f2;--error-border:#fca5a5;
+    --login:#7c3aed;--login-light:#f5f3ff;--login-border:#c4b5fd;
+    --text:#111827;--text-sub:#374151;--text-muted:#6b7280;
+    --border:#e5e7eb;--border-mid:#d1d5db;
+    --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.06);
   }
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'Hiragino Sans','Yu Gothic UI',sans-serif;
@@ -710,7 +944,7 @@ HTML = """<!DOCTYPE html>
   .hdr-icon{width:34px;height:34px;background:rgba(255,255,255,.12);border-radius:8px;
     display:flex;align-items:center;justify-content:center;flex-shrink:0}
   .hdr-title{font-size:1.05em;font-weight:700;color:#fff;letter-spacing:.02em}
-  .hdr-sub{font-size:.75em;color:rgba(255,255,255,.5);margin-left:2px}
+  .hdr-sub{font-size:.73em;color:rgba(255,255,255,.5);margin-left:2px}
 
   .layout{display:grid;grid-template-columns:210px 1fr;min-height:calc(100vh - 56px)}
 
@@ -729,7 +963,7 @@ HTML = """<!DOCTYPE html>
     transition:background .12s,color .12s,border-color .12s}
   .job-btn.active .job-abbr{background:var(--primary);color:#fff;border-color:var(--primary)}
 
-  .main{padding:28px 30px;overflow-x:hidden}
+  .main{padding:24px 28px;overflow-x:hidden}
 
   .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;
     height:60vh;color:var(--text-muted);text-align:center;gap:10px}
@@ -738,73 +972,98 @@ HTML = """<!DOCTYPE html>
   .empty h3{font-size:.95em;font-weight:600;color:var(--text-sub)}
   .empty p{font-size:.83em;line-height:1.7}
 
+  /* プログレス */
   .progress-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
-    padding:18px 20px;margin-bottom:18px;box-shadow:var(--shadow-sm)}
+    padding:16px 20px;margin-bottom:18px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
   .progress-head{display:flex;align-items:center;gap:8px;font-size:.78em;font-weight:700;
-    color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:14px}
-  .site-rows{display:flex;flex-direction:column;gap:5px}
-  .site-row{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;
-    background:var(--bg);border:1px solid var(--border);transition:all .22s}
+    color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px}
+  .site-rows{display:flex;flex-direction:column;gap:4px}
+  .site-row{display:flex;align-items:center;gap:10px;padding:7px 12px;border-radius:6px;
+    background:var(--bg);border:1px solid var(--border);transition:all .22s;min-height:38px}
   .site-row.searching{background:var(--warning-light);border-color:var(--warning-border)}
-  .site-row.done{background:var(--success-light);border-color:var(--success-border)}
-  .site-row.error{background:var(--error-light);border-color:var(--error-border)}
+  .site-row.done    {background:var(--success-light);border-color:var(--success-border)}
+  .site-row.error   {background:var(--error-light);border-color:var(--error-border)}
+  .site-row.login-wait{background:var(--login-light);border-color:var(--login-border)}
+  .site-row.scraping{background:var(--primary-light);border-color:var(--primary-border)}
   .s-dot{width:7px;height:7px;border-radius:50%;background:var(--border);flex-shrink:0}
-  .site-row.searching .s-dot{background:var(--warning);animation:blink .85s infinite}
-  .site-row.done .s-dot{background:var(--success)}
+  .site-row.searching .s-dot,.site-row.login-wait .s-dot,.site-row.scraping .s-dot{
+    animation:blink .85s infinite}
+  .site-row.searching .s-dot{background:var(--warning)}
+  .site-row.login-wait .s-dot{background:var(--login)}
+  .site-row.scraping .s-dot{background:var(--primary)}
+  .site-row.done  .s-dot{background:var(--success)}
   .site-row.error .s-dot{background:var(--error)}
   @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-  .s-name{font-size:.86em;font-weight:600;min-width:88px;color:var(--text-sub)}
-  .s-status{font-size:.79em;color:var(--text-muted)}
-  .s-badge{margin-left:auto;font-size:.73em;color:var(--text-muted);
-    background:rgba(0,0,0,.05);padding:2px 8px;border-radius:10px}
+  .s-name{font-size:.85em;font-weight:600;min-width:96px;color:var(--text-sub)}
+  .s-status{font-size:.78em;color:var(--text-muted);flex:1}
+  .s-status b{color:var(--login);font-weight:700}
+  .s-badge{font-size:.72em;color:var(--text-muted);background:rgba(0,0,0,.05);
+    padding:2px 8px;border-radius:10px;white-space:nowrap}
 
-  .meta-bar{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+  .meta-bar{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
   .kw-pill{font-size:.83em;font-weight:700;background:var(--primary);color:#fff;
     padding:3px 13px;border-radius:20px}
   .meta-ts{font-size:.78em;color:var(--text-muted)}
   .meta-total{font-size:.78em;color:var(--success);font-weight:600;margin-left:auto}
 
-  .rankings{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-  @media(max-width:920px){.rankings{grid-template-columns:1fr}}
+  .rankings{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:960px){.rankings{grid-template-columns:1fr}}
 
   .rank-card{background:var(--surface);border:1px solid var(--border);
     border-radius:10px;overflow:hidden;box-shadow:var(--shadow)}
-  .rank-head{display:flex;align-items:center;gap:8px;padding:12px 16px;
+  .rank-head{display:flex;align-items:center;gap:8px;padding:11px 16px;
     font-size:.83em;font-weight:700;border-bottom:1px solid var(--border)}
-  .rank-head.t-jikyu{background:var(--warning-light);color:var(--warning);
+  .rank-head.t-jikyu {background:var(--warning-light);color:var(--warning);
     border-bottom-color:var(--warning-border)}
   .rank-head.t-salary{background:var(--success-light);color:var(--success);
     border-bottom-color:var(--success-border)}
   .head-badge{width:20px;height:20px;border-radius:4px;display:flex;align-items:center;
     justify-content:center;font-size:.72em;font-weight:800;flex-shrink:0}
-  .t-jikyu .head-badge{background:var(--warning-border);color:var(--warning)}
+  .t-jikyu  .head-badge{background:var(--warning-border);color:var(--warning)}
   .t-salary .head-badge{background:var(--success-border);color:var(--success)}
 
-  .rank-item{display:grid;grid-template-columns:38px 82px 1fr auto;align-items:center;
-    padding:10px 14px;gap:8px;border-bottom:1px solid var(--border);transition:background .1s}
+  /* ランクアイテム */
+  .rank-item{display:flex;align-items:flex-start;gap:9px;
+    padding:10px 14px;border-bottom:1px solid var(--border);transition:background .1s}
   .rank-item:last-child{border-bottom:none}
   .rank-item:hover{background:var(--bg)}
   .rank-num{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;
-    justify-content:center;font-size:.75em;font-weight:800;margin:0 auto;flex-shrink:0}
+    justify-content:center;font-size:.74em;font-weight:800;flex-shrink:0;margin-top:2px}
   .n1{background:#fef3c7;color:#92400e;border:2px solid #f59e0b}
   .n2{background:#f1f5f9;color:#475569;border:2px solid #94a3b8}
   .n3{background:#fdf4e7;color:#7c3a00;border:2px solid #d97706}
-  .n4,.n5{background:#f9fafb;color:#9ca3af;border:2px solid #e5e7eb}
+  .n4,.n5,.n6,.n7,.n8,.n9,.n10{background:#f9fafb;color:#9ca3af;border:2px solid #e5e7eb}
 
-  .site-tag{font-size:.67em;font-weight:700;padding:2px 6px;border-radius:4px;
-    text-align:center;white-space:nowrap}
-  .tag-Indeed{background:#1a56db;color:#fff}
-  .tag-エンゲージ{background:#e8620f;color:#fff}
-  .tag-マイナビ{background:#e60020;color:#fff}
-  .tag-マイナビ転職{background:#cc0033;color:#fff}
-  .tag-エン転職{background:#059669;color:#fff}
+  .job-info{flex:1;min-width:0}
+  .tags{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:4px;align-items:center}
+  .job-title{font-size:.82em;line-height:1.4;color:var(--text)}
+  .job-company{font-size:.72em;color:var(--text-muted);margin-top:2px}
+  .salary-val{font-size:.88em;font-weight:700;color:var(--primary);white-space:nowrap;
+    text-align:right;flex-shrink:0;margin-top:3px}
 
-  .job-title{font-size:.83em;line-height:1.4;color:var(--text)}
-  .job-company{font-size:.73em;color:var(--text-muted);margin-top:2px}
-  .salary-val{font-size:.9em;font-weight:700;color:var(--primary);white-space:nowrap;text-align:right}
-  .rank-empty{padding:28px 16px;text-align:center;color:var(--text-muted);font-size:.84em}
+  /* タグ類 */
+  .site-tag{font-size:.64em;font-weight:700;padding:2px 6px;border-radius:4px;
+    white-space:nowrap;flex-shrink:0}
+  .tag-Indeed       {background:#1a56db;color:#fff}
+  .tag-エンゲージ   {background:#e8620f;color:#fff}
+  .tag-マイナビ     {background:#e60020;color:#fff}
+  .tag-マイナビ転職 {background:#cc0033;color:#fff}
+  .tag-エン転職     {background:#059669;color:#fff}
+  .tag-バイトル     {background:#0891b2;color:#fff}
 
-  .note{font-size:.75em;color:var(--text-muted);margin-top:16px;padding:9px 12px;
+  .emp-tag{font-size:.63em;font-weight:700;padding:2px 5px;border-radius:3px;white-space:nowrap}
+  .emp-haken  {background:#dbeafe;color:#1e40af}
+  .emp-baito  {background:#fef9c3;color:#854d0e}
+  .emp-part   {background:#dcfce7;color:#166534}
+  .emp-seisya {background:#f3e8ff;color:#6b21a8}
+  .emp-other  {background:#f3f4f6;color:#374151}
+
+  .sched-tag{font-size:.63em;padding:2px 5px;border-radius:3px;white-space:nowrap;
+    background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0}
+
+  .rank-empty{padding:24px 16px;text-align:center;color:var(--text-muted);font-size:.84em}
+
+  .note{font-size:.75em;color:var(--text-muted);margin-top:14px;padding:9px 12px;
     background:var(--surface);border-left:3px solid var(--border-mid);border-radius:0 6px 6px 0}
 
   .spinner{display:inline-block;width:11px;height:11px;border:2px solid var(--border-mid);
@@ -816,7 +1075,6 @@ HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-
 <header>
   <div class="hdr-icon">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
@@ -828,7 +1086,7 @@ HTML = """<!DOCTYPE html>
     </svg>
   </div>
   <span class="hdr-title">求人給与ランキング</span>
-  <span class="hdr-sub">Indeed / エンゲージ / マイナビ / マイナビ転職 / エン転職</span>
+  <span class="hdr-sub">Indeed / エンゲージ / マイナビ / マイナビ転職 / エン転職 / バイトル</span>
 </header>
 
 <div class="layout">
@@ -854,8 +1112,12 @@ HTML = """<!DOCTYPE html>
 const JOBS=[["営","営業職"],["事","事務職"],["エ","エンジニア"],
   ["販","販売・接客"],["製","製造・工場"],["介","介護・福祉"],
   ["ド","ドライバー"],["軽","軽作業"],["医","医療・看護"],["デ","デザイナー"]];
-const SITES=["Indeed","マイナビ転職","エン転職","エンゲージ","マイナビ"];
-const RC=["n1","n2","n3","n4","n5"];
+const SITES=["マイナビ転職","エン転職","バイトル","Indeed","マイナビ","エンゲージ"];
+const RC=["n1","n2","n3","n4","n5","n6","n7","n8","n9","n10"];
+const EMP_CLS={
+  "派遣":"emp-haken","アルバイト":"emp-baito","パート":"emp-part",
+  "正社員":"emp-seisya"
+};
 let es=null;
 
 const ba=document.getElementById("jobButtons");
@@ -866,7 +1128,9 @@ JOBS.forEach(([a,n])=>{
   b.onclick=()=>go(n);ba.appendChild(b);
 });
 
-function setActive(kw){document.querySelectorAll(".job-btn").forEach(b=>b.classList.toggle("active",b.dataset.kw===kw))}
+function setActive(kw){
+  document.querySelectorAll(".job-btn").forEach(b=>b.classList.toggle("active",b.dataset.kw===kw));
+}
 
 function go(kw){
   if(es){es.close();es=null;}
@@ -875,20 +1139,16 @@ function go(kw){
   es=new EventSource("/search?keyword="+encodeURIComponent(kw));
   es.onmessage=ev=>{
     const d=JSON.parse(ev.data);
-    if(d.type==="progress")onProg(d);
-    else if(d.type==="result")onResult(d,kw);
+    if(d.type==="progress") onProg(d);
+    else if(d.type==="result") onResult(d,kw);
     else if(d.type==="end"){es.close();es=null;}
   };
-  es.onerror=()=>{
-    const r=document.querySelector(".site-row.searching");
-    if(r)r.className="site-row error";
-    es.close();es=null;
-  };
+  es.onerror=()=>{es.close();es=null;};
 }
 
 function loadUI(kw){
   return`<div class="progress-card">
-    <div class="progress-head"><span class="spinner"></span>&nbsp;「${x(kw)}」を検索中</div>
+    <div class="progress-head"><span class="spinner"></span>&nbsp;「${x(kw)}」を検索中...</div>
     <div class="site-rows">${SITES.map(s=>`
       <div class="site-row" id="r-${s}">
         <div class="s-dot"></div>
@@ -901,23 +1161,38 @@ function loadUI(kw){
 }
 
 function onProg(d){
-  const r=document.getElementById("r-"+d.site);if(!r)return;
+  const r=document.getElementById("r-"+d.site);
+  if(!r) return;
+  const dot=r.querySelector(".s-dot");
+  const st=r.querySelector(".s-status");
+  const existBadge=r.querySelector(".s-badge");
   if(d.status==="searching"){
     r.className="site-row searching";
-    r.querySelector(".s-status").textContent="検索中...";
-  }else if(d.status==="done"){
+    st.textContent="検索中...";
+  } else if(d.status==="login_wait"){
+    r.className="site-row login-wait";
+    st.innerHTML="<b>ブラウザが開きました。Indeedにログインしてください</b>";
+  } else if(d.status==="countdown"){
+    r.className="site-row login-wait";
+    st.innerHTML=`<b>ログイン待機中... あと${d.seconds}秒</b>`;
+  } else if(d.status==="scraping"){
+    r.className="site-row scraping";
+    st.textContent="スクレイピング中...";
+  } else if(d.status==="done"){
+    if(existBadge) existBadge.remove();
     r.className="site-row done";
-    r.querySelector(".s-status").textContent=d.count+"件取得";
-    r.insertAdjacentHTML("beforeend",`<div class="s-badge">${d.salary_count}件 給与あり</div>`);
-  }else{
+    st.textContent=d.count+"件取得";
+    r.insertAdjacentHTML("beforeend",
+      `<div class="s-badge">${d.salary_count}件 給与あり</div>`);
+  } else if(d.status==="error"){
     r.className="site-row error";
-    r.querySelector(".s-status").textContent="取得できませんでした";
+    st.textContent="取得できませんでした";
   }
 }
 
 function onResult(d,kw){
   const ph=document.querySelector(".progress-head");
-  if(ph)ph.innerHTML='<span class="done-mark">&#10003;</span>&nbsp;収集完了';
+  if(ph) ph.innerHTML='<span class="done-mark">&#10003;</span>&nbsp;収集完了';
   document.getElementById("ra").innerHTML=`
     <div class="meta-bar">
       <span class="kw-pill">${x(kw)}</span>
@@ -925,30 +1200,47 @@ function onResult(d,kw){
       <span class="meta-total">合計 ${d.total} 件収集</span>
     </div>
     <div class="rankings">
-      ${card("時給ランキング TOP5","jikyu",d.jikyu_ranking)}
-      ${card("給与ランキング TOP5（時給換算）","salary",d.salary_ranking)}
+      ${card("時給ランキング TOP10","jikyu",d.jikyu_ranking)}
+      ${card("給与ランキング TOP10（時給換算）","salary",d.salary_ranking)}
     </div>
     <div class="note">
       ※ 月給・年収は月160時間勤務換算で時給に変換して比較しています。<br>
-      ※ Indeed はクラウドサーバーからのアクセスでブロックされる場合があります。
+      ※ 給与範囲（例:時給1900〜2500円）は上限値を使用しています。<br>
+      ※ Indeedはブラウザを開いて検索します。初回はログインが必要です（以降は自動）。
     </div>`;
+}
+
+function empTag(emp){
+  if(!emp) return '';
+  const cls=EMP_CLS[emp]||'emp-other';
+  return `<span class="emp-tag ${cls}">${emp}</span>`;
+}
+
+function schedTag(sched){
+  return sched ? `<span class="sched-tag">${sched}</span>` : '';
 }
 
 function card(title,type,jobs){
   const badge=type==="jikyu"?"時":"給";
   const rows=jobs.length
-    ?jobs.map((j,i)=>`
+    ? jobs.map((j,i)=>`
       <div class="rank-item">
         <div class="rank-num ${RC[i]}">${i+1}</div>
-        <div><span class="site-tag tag-${j.site}">${j.site}</span></div>
-        <div><div class="job-title">${x(j.title)}</div>
-          ${j.company?`<div class="job-company">${x(j.company)}</div>`:""}</div>
+        <div class="job-info">
+          <div class="tags">
+            <span class="site-tag tag-${j.site}">${j.site}</span>
+            ${empTag(j.emp)}
+            ${schedTag(j.sched)}
+          </div>
+          <div class="job-title">${x(j.title)}</div>
+          ${j.company?`<div class="job-company">${x(j.company)}</div>`:''}
+        </div>
         <div class="salary-val">${x(j.salary)}</div>
-      </div>`).join("")
-    :`<div class="rank-empty">給与情報を含む求人が取得できませんでした</div>`;
+      </div>`).join('')
+    : `<div class="rank-empty">給与情報を含む求人が取得できませんでした</div>`;
   return`<div class="rank-card">
     <div class="rank-head t-${type}"><div class="head-badge">${badge}</div>${x(title)}</div>
-    <div>${rows}</div>
+    ${rows}
   </div>`;
 }
 
@@ -961,19 +1253,20 @@ function x(s){return(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8080))
-    is_local = os.environ.get("RENDER") is None
+    print("\n" + "=" * 56)
+    print("  求人給与ランキング（ローカル専用・高精度版）起動中")
+    print("=" * 56)
+    print(f"  ブラウザで開く → http://localhost:{port}")
+    print()
+    print("  ★ Indeed について:")
+    print("    初回: ブラウザが自動で開くのでログインしてください")
+    print("    2回目以降: ログイン状態が保存されます")
+    print("=" * 56 + "\n")
 
-    print("\n" + "=" * 50)
-    print("  求人給与ランキング Webアプリ 起動中...")
-    print("=" * 50)
-    if is_local:
-        print(f"  ブラウザで開く → http://localhost:{port}")
-        import subprocess, time
-        def open_browser():
-            time.sleep(1.5)
-            subprocess.run(["open", f"http://localhost:{port}"])
-        threading.Thread(target=open_browser, daemon=True).start()
-    else:
-        print("  Render上で起動中...")
-    print("=" * 50 + "\n")
+    import subprocess, time
+    def open_browser():
+        time.sleep(1.5)
+        subprocess.run(["open", f"http://localhost:{port}"])
+    threading.Thread(target=open_browser, daemon=True).start()
+
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
